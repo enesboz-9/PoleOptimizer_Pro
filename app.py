@@ -51,9 +51,13 @@ class SketchLineTools(MacroElement):
        kadar kısaltılır (trim).
     3) Otomatik uç birleştirme -> yeni çizilen bir çizginin ucu, mevcut bir
        çizginin ucuna (piksel bazlı bir eşiğin içinde) denk gelirse iki
-       çizgi otomatik olarak TEK bir çizgide birleştirilir. Çizim sırasında
-       imleç böyle bir uca yaklaşınca yeşil bir halka ile "🔗 Birleştirilecek"
-       ipucu gösterilir.
+       çizgi otomatik olarak TEK bir çizgide birleştirilir (birden fazla
+       aday uç varsa piksel mesafesine göre EN YAKIN olan seçilir). Eğer
+       birleşme hattı kapalı bir döngüye çevirecekse (iki ucu birbirine
+       çok yakınsa) birleştirme YAPILMAZ — bir havai hat güzergahı A'dan
+       B'ye açık bir hattır, kapalı bir çember olması neredeyse her zaman
+       istenmeyen bir durumdur. Çizim sırasında imleç böyle bir uca
+       yaklaşınca yeşil bir halka ile "🔗 Birleştirilecek" ipucu gösterilir.
     """
 
     _template = Template(
@@ -212,6 +216,24 @@ class SketchLineTools(MacroElement):
             });
 
             // ---------- 4) Uç uca yakın gelen iki çizgiyi otomatik birleştir ----------
+            //
+            // NOT (hata düzeltmesi): Bu blok önceden iki soruna yol açıyordu:
+            //  a) fg.eachLayer() içinde koşulu sağlayan İLK çizgiyle
+            //     birleşiyordu (en YAKIN olanla değil) — birden fazla aday
+            //     çizgi/uç varken (örn. bir bina adasının etrafını dolaşan
+            //     bir kroki, kendi başlangıç noktasına yakınlaşınca) yanlış
+            //     uca birleşip hattı bir döngüye/dikdörtgene kilitleyebiliyordu.
+            //  b) Tüketilen `newLayer`, `setTimeout(..., 0)` ile GECİKMELİ
+            //     siliniyordu. streamlit-folium'un kendi 'draw:created'
+            //     dinleyicisi (bizimkinden SONRA, ama AYNI olay turunda,
+            //     senkron çalışır) `window.drawnItems.toGeoJSON()` ile TÜM
+            //     katmanları o an serileştirir — silme henüz gerçekleşmediği
+            //     için hem birleştirilmiş asıl çizgi HEM DE silinmeyi
+            //     bekleyen küçük parça birlikte Python'a "all_drawings"
+            //     olarak gönderiliyordu; bu da "otomatik algıla" adımının
+            //     haritada görünenle tutarsız/hayalet bir geometri seçmesine
+            //     yol açabiliyordu. Çözüm: silmeyi SENKRON (aynı tık
+            //     içinde) yapmak.
             function closeEnough(a, b) {
                 return toPx(a).distanceTo(toPx(b)) < SNAP_PX;
             }
@@ -221,34 +243,58 @@ class SketchLineTools(MacroElement):
                 var newLayer = e.layer;
                 var newLatLngs = newLayer.getLatLngs();
                 if (!Array.isArray(newLatLngs) || newLatLngs.length < 2) return;
-                var merged = false;
+                var newStart = newLatLngs[0], newEnd = newLatLngs[newLatLngs.length - 1];
+
+                // Tüm mevcut çizgilerin HER iki ucu ile yeni çizginin HER iki
+                // ucu arasındaki 4 olası eşleşmeyi piksel mesafesine göre
+                // karşılaştırıp GLOBAL olarak en yakın eşleşmeyi seç.
+                var bestMatch = null; // {layer, combined, dist}
                 fg.eachLayer(function(existing) {
-                    if (merged || existing === newLayer) return;
+                    if (existing === newLayer) return;
                     if (!(existing instanceof L.Polyline) || existing instanceof L.Polygon) return;
                     var exLatLngs = existing.getLatLngs();
                     if (!Array.isArray(exLatLngs) || exLatLngs.length < 2 || Array.isArray(exLatLngs[0])) return;
                     var exStart = exLatLngs[0], exEnd = exLatLngs[exLatLngs.length - 1];
-                    var newStart = newLatLngs[0], newEnd = newLatLngs[newLatLngs.length - 1];
-                    var combined = null;
-                    if (closeEnough(exEnd, newStart)) {
-                        combined = exLatLngs.concat(newLatLngs.slice(1));
-                    } else if (closeEnough(exStart, newEnd)) {
-                        combined = newLatLngs.concat(exLatLngs.slice(1));
-                    } else if (closeEnough(exEnd, newEnd)) {
-                        combined = exLatLngs.concat(newLatLngs.slice().reverse().slice(1));
-                    } else if (closeEnough(exStart, newStart)) {
-                        combined = exLatLngs.slice().reverse().concat(newLatLngs.slice(1));
-                    }
-                    if (combined) {
-                        existing.setLatLngs(combined);
-                        merged = true;
-                    }
+
+                    var candidates = [
+                        {a: exEnd, b: newStart, combined: exLatLngs.concat(newLatLngs.slice(1))},
+                        {a: exStart, b: newEnd, combined: newLatLngs.concat(exLatLngs.slice(1))},
+                        {a: exEnd, b: newEnd, combined: exLatLngs.concat(newLatLngs.slice().reverse().slice(1))},
+                        {a: exStart, b: newStart, combined: exLatLngs.slice().reverse().concat(newLatLngs.slice(1))},
+                    ];
+                    candidates.forEach(function(c) {
+                        var dist = toPx(c.a).distanceTo(toPx(c.b));
+                        if (dist < SNAP_PX && (!bestMatch || dist < bestMatch.dist)) {
+                            bestMatch = {layer: existing, combined: c.combined, dist: dist};
+                        }
+                    });
                 });
-                if (merged) {
-                    // Yeni çizilen küçük parça, mevcut çizgiyle birleştirildiği
-                    // için ayrı bir katman olarak tutulmasına gerek yok.
-                    setTimeout(function() { fg.removeLayer(newLayer); }, 0);
+
+                if (!bestMatch) return;
+
+                // Kapalı döngü koruması: birleşme sonucunda ortaya çıkacak
+                // hattın İKİ UCU da birbirine çok yakınsa (kroki kendi
+                // üzerine kapanıyorsa), bu neredeyse HER ZAMAN istenmeyen
+                // bir durumdur — bir havai hat güzergahı A'dan B'ye AÇIK bir
+                // hattır, kapalı bir döngü/dikdörtgen değildir (ekran
+                // görüntüsünde görülen sorun tam olarak buydu: kroki bir
+                // bina adasının etrafını sararak başlangıcına "birleşmiş").
+                // Böyle bir birleşme SESSİZCE yapılmaz; iki çizgi ayrı kalır
+                // ve kullanıcı elle düzenleme/silme aracıyla düzeltebilir.
+                var combined = bestMatch.combined;
+                var combinedStart = combined[0], combinedEnd = combined[combined.length - 1];
+                if (closeEnough(combinedStart, combinedEnd)) {
+                    return;
                 }
+
+                bestMatch.layer.setLatLngs(combined);
+                // Senkron silme: streamlit-folium'un aynı olay turunda
+                // çalışan 'draw:created' dinleyicisi, bu satır çalıştıktan
+                // SONRA devreye girer (script kayıt sırası nedeniyle) — bu
+                // yüzden setTimeout'a gerek yok, gecikme yalnızca hayalet
+                // (silinmeyi bekleyen) katmanın Python tarafına sızmasına
+                // neden oluyordu.
+                fg.removeLayer(newLayer);
             });
         })();
         {% endmacro %}
@@ -436,8 +482,12 @@ if input_mode == "sketch":
         "haritaya tıkladığınızda en yakın çizginin, tıkladığınız noktaya en "
         "yakın ucu o noktaya kadar kısaltılır. Yeni bir çizgiyi mevcut bir "
         "çizginin ucuna yakın bitirirseniz (imleç yeşil 🔗 halkayla bunu "
-        "gösterir), iki çizgi otomatik olarak tek bir hatta birleştirilir. "
-        "🎯 (sağ üst) ise çizdiğiniz tüm hatta otomatik olarak odaklanır/zum yapar."
+        "gösterir), iki çizgi otomatik olarak tek bir hatta birleştirilir "
+        "(birden fazla aday uç varsa EN YAKIN olan seçilir). Birleştirme, "
+        "hattı kapalı bir döngüye (başlangıcın kendi ucuna kapanmasına) "
+        "çevirecekse GÜVENLİK NEDENİYLE yapılmaz — çizgiler ayrı kalır, "
+        "gerekirse elle düzenleyin. 🎯 (sağ üst) ise çizdiğiniz tüm hatta "
+        "otomatik olarak odaklanır/zum yapar."
     )
 
     use_direct_line = st.checkbox(
