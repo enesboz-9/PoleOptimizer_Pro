@@ -17,8 +17,6 @@ tutulacak ham girdi (raw candidate set) olarak kullanılır.
 Bağımlılıklar:
     pip install osmnx geopandas shapely networkx pyproj numpy
 
-Yazar: PoleOptimizer Pro Engineering Team
-"""
 
 from __future__ import annotations
 
