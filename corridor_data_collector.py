@@ -101,6 +101,23 @@ class VirtualNode:
             (guy-wire / gerilme direği) mühendislik açısından düz hat
             üzerindeki ara direklerden farklı muamele görür; bu yüzden
             zorunlu (atlanamaz) düğüm olarak işaretlenir.
+        deflection_angle_deg: Bu düğümde, gelen ve giden hat segmentleri
+            arasındaki sapma açısı (derece, 0 = tam düz devam). Yalnızca
+            `is_corner=True` olan düğümler için anlamlıdır; düz ara
+            direklerde 0.0'dır.
+        pole_type: TEDAŞ şartname pratiğine yakın kaba direk sınıflaması:
+            "nihayet" -> hattın başlangıç (A) ya da bitiş (B) ucu; hat bu
+                direkte sonlanır, tam gerilim (nihayet) direğidir.
+            "açı" -> güzergahın `ANGLE_DEFLECTION_THRESHOLD_DEG` değerini
+                aşan bir yönde döndüğü kavşak/köşe noktası; açısal çekme
+                kuvveti nedeniyle payanda/gerilme direği gerektirir.
+            "ara" -> düz hat üzerindeki (ya da açısı eşiğin altında kalan)
+                taşıyıcı/ara direk.
+            NOT: Bu sınıflama, gerçek TEDAŞ projelendirme şartnamesinin
+            (statik/mekanik hesap, zemin etüdü, rüzgar/buz yükü vb.)
+            YERİNE GEÇMEZ — sadece saha ön çalışması için kaba bir
+            yönlendirmedir; nihai direk tipi TEDAŞ onaylı projelendirme
+            mühendisi tarafından belirlenmelidir.
     """
     node_id: int
     point: GeoPoint
@@ -110,6 +127,8 @@ class VirtualNode:
     elevation_m: Optional[float] = None
     blocking_reason: Optional[str] = None
     is_corner: bool = False
+    deflection_angle_deg: float = 0.0
+    pole_type: str = "ara"
 
 
 @dataclass
@@ -264,6 +283,33 @@ class CorridorDataCollector:
     BUILDING_TAGS = {"building": True}
     ROAD_TAGS = {"highway": True}
 
+    # ---------------------------------------------------------------- #
+    # TEDAŞ şartnamesine yaklaşım: gerilim sınıfına göre azami açıklık
+    # (max span) değerleri.
+    #
+    # ÖNEMLİ KAYNAK NOTU: Bu değerler, Türkiye dağıtım şebekesinde
+    # (TEDAŞ/bağlı dağıtım şirketleri) YAYGIN OLARAK UYGULANAN tipik
+    # havai hat projelendirme pratiklerine dayanan YAKLAŞIK üst
+    # sınırlardır (iletken kesiti, direk boyu/sınıfı, güzergahın
+    # rüzgar/buz yükü bölgesi, zemin cinsi ve arazi eğimine göre saha
+    # bazında değişebilir). Belirli bir TEDAŞ-MYD/TEDAŞ-MLZ şartname
+    # maddesinden BİREBİR alınmamıştır; nihai açıklık değeri her zaman
+    # ilgili bölge dağıtım şirketinin güncel projelendirme şartnamesi ve
+    # onaylı statik/mekanik hesap ile TEYİT EDİLMELİDİR. Bu araç yalnızca
+    # saha ön çalışması (fizibilite) amaçlıdır, uygulama projesi yerine
+    # geçmez.
+    VOLTAGE_SPAN_LIMITS_M = {
+        "AG": 40.0,      # Alçak Gerilim (0.4 kV) dağıtım hattı
+        "OG": 100.0,     # Orta Gerilim (34.5 kV) dağıtım hattı
+    }
+
+    # Bir düğümdeki yön değişimi (sapma açısı) bu eşiği aşarsa, düğüm
+    # "açı direği" (angle pole / açısal çekme kuvvetine maruz, payandalı)
+    # olarak sınıflandırılır; aksi halde düz hat ara direği sayılır. 15°
+    # değeri de yukarıdaki gibi tipik saha pratiğine dayanan yaklaşık bir
+    # eşiktir, kesin şartname maddesi değildir.
+    ANGLE_DEFLECTION_THRESHOLD_DEG = 15.0
+
     def __init__(
         self,
         start: GeoPoint,
@@ -272,6 +318,7 @@ class CorridorDataCollector:
         node_spacing_m: float = 30.0,
         pole_offset_m: float = 5.0,
         offset_side: str = "right",
+        voltage_class: str = "OG",
     ) -> None:
         if corridor_buffer_m <= 0:
             raise ValueError("corridor_buffer_m sıfırdan büyük olmalıdır.")
@@ -281,11 +328,25 @@ class CorridorDataCollector:
             raise ValueError("pole_offset_m negatif olamaz.")
         if offset_side not in ("left", "right"):
             raise ValueError("offset_side yalnızca 'left' veya 'right' olabilir.")
+        if voltage_class not in self.VOLTAGE_SPAN_LIMITS_M:
+            raise ValueError(
+                f"voltage_class yalnızca {list(self.VOLTAGE_SPAN_LIMITS_M)} "
+                f"olabilir, verilen: {voltage_class!r}"
+            )
 
         self.start = start
         self.end = end
         self.corridor_buffer_m = corridor_buffer_m
-        self.node_spacing_m = node_spacing_m
+        self.voltage_class = voltage_class
+        self.max_span_m = self.VOLTAGE_SPAN_LIMITS_M[voltage_class]
+        if node_spacing_m > self.max_span_m:
+            logger.warning(
+                "node_spacing_m (%.1fm) seçilen gerilim sınıfının (%s) "
+                "yaklaşık azami açıklığını (%.1fm) aşıyor; düğüm üretimi "
+                "sırasında %.1fm ile sınırlandırılacak.",
+                node_spacing_m, voltage_class, self.max_span_m, self.max_span_m,
+            )
+        self.node_spacing_m = min(node_spacing_m, self.max_span_m)
         # pole_offset_m: Direklerin yol ORTA HATTINDAN ne kadar uzağa,
         # kaldırım/yol kenarına doğru kaydırılacağı (metre). 0 verilirse
         # direkler yolun tam ortasında kalır (gerçekçi değildir, trafiği
@@ -307,9 +368,11 @@ class CorridorDataCollector:
 
         logger.info(
             "CorridorDataCollector başlatıldı | A=%s B=%s | UTM=%s | "
-            "buffer=%.1fm | spacing=%.1fm | pole_offset=%.1fm (%s)",
+            "buffer=%.1fm | spacing=%.1fm (azami %.1fm, %s) | "
+            "pole_offset=%.1fm (%s)",
             start.as_tuple(), end.as_tuple(), self.utm_epsg,
-            corridor_buffer_m, node_spacing_m, pole_offset_m, offset_side,
+            corridor_buffer_m, self.node_spacing_m, self.max_span_m,
+            voltage_class, pole_offset_m, offset_side,
         )
 
     # -------------------------------------------------------------- #
@@ -1140,6 +1203,8 @@ class CorridorDataCollector:
                     cumulative_distance_m=node.cumulative_distance_m,
                     span_length_m=node.span_length_m,
                     is_corner=node.is_corner,
+                    deflection_angle_deg=node.deflection_angle_deg,
+                    pole_type=node.pole_type,
                 )
 
             )
@@ -1189,6 +1254,7 @@ class CorridorDataCollector:
                 cumulative_distance_m=0.0,
                 span_length_m=0.0,  # A ucu: önceki direk yok.
                 is_corner=True,
+                pole_type="nihayet",
             )
         )
         node_id += 1
@@ -1214,6 +1280,23 @@ class CorridorDataCollector:
                 # orijinal rotanın gerçek bir vertex'ine (köşesine)
                 # denk gelir; bu yüzden köşe olarak işaretlenir.
                 is_corner_point = (k == num_subsegments)
+                is_last_vertex = is_corner_point and (i == len(coords) - 2)
+
+                deflection_deg = 0.0
+                pole_type = "ara"
+                if is_last_vertex:
+                    # Rotanın B ucu: hattın nihayet (son) direği.
+                    pole_type = "nihayet"
+                elif is_corner_point and (i + 2) < len(coords):
+                    # Gelen segment (p1->p2) ile giden segment
+                    # (coords[i+1]->coords[i+2]) arasındaki sapma açısı.
+                    p3 = np.array(coords[i + 2])
+                    deflection_deg = self._deflection_angle_deg(p2 - p1, p3 - p2)
+                    pole_type = (
+                        "açı"
+                        if deflection_deg >= self.ANGLE_DEFLECTION_THRESHOLD_DEG
+                        else "ara"
+                    )
 
                 nodes.append(
                     VirtualNode(
@@ -1224,6 +1307,8 @@ class CorridorDataCollector:
                             cumulative_distance_at_point - prev_cumulative_distance, 3
                         ),
                         is_corner=is_corner_point,
+                        deflection_angle_deg=round(deflection_deg, 2),
+                        pole_type=pole_type,
                     )
                 )
                 node_id += 1
@@ -1232,13 +1317,53 @@ class CorridorDataCollector:
             cumulative_distance += segment_length
 
         num_corners = sum(1 for n in nodes if n.is_corner)
+        num_angle_poles = sum(1 for n in nodes if n.pole_type == "açı")
+        num_over_limit = sum(
+            1 for n in nodes if n.span_length_m > self.max_span_m + 1e-6
+        )
         logger.info(
             "Toplam rota mesafesi: %.2f m | Üretilen düğüm sayısı: %d "
-            "(köşe/kavşak düğümü: %d) | hedef aralık: %.1fm",
-            cumulative_distance, len(nodes), num_corners, self.node_spacing_m,
+            "(köşe/kavşak: %d, açı direği: %d) | hedef aralık: %.1fm | "
+            "gerilim sınıfı: %s (azami açıklık: %.1fm) | açıklığı aşan "
+            "düğüm: %d",
+            cumulative_distance, len(nodes), num_corners, num_angle_poles,
+            self.node_spacing_m, self.voltage_class, self.max_span_m,
+            num_over_limit,
         )
+        if num_over_limit:
+            logger.warning(
+                "%d düğümün açıklığı (span) %s sınıfı için yaklaşık azami "
+                "değeri (%.1fm) aşıyor — bu genellikle rota köşelerinde "
+                "(vertex'ler arası mesafe zorunlu olarak korunduğu için) "
+                "oluşur; ilgili direkler saha/projelendirme aşamasında "
+                "ayrıca değerlendirilmelidir.",
+                num_over_limit, self.voltage_class, self.max_span_m,
+            )
 
         return nodes
+
+    @staticmethod
+    def _deflection_angle_deg(v1: np.ndarray, v2: np.ndarray) -> float:
+        """İki ardışık segment vektörü arasındaki sapma (deflection)
+        açısını derece cinsinden hesaplar.
+
+        0° = giden segment, gelen segmentin tam devamı (düz hat).
+        180° = giden segment, gelen segmentin tam tersi yöne dönüyor.
+
+        Args:
+            v1: Gelen segment vektörü (p1 -> p2), UTM düzleminde (x, y).
+            v2: Giden segment vektörü (p2 -> p3), UTM düzleminde (x, y).
+
+        Returns:
+            0-180 derece arası sapma açısı. Vektörlerden biri sıfır
+            uzunluktaysa (çakışık noktalar) 0.0 döner.
+        """
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 < 1e-9 or n2 < 1e-9:
+            return 0.0
+        cos_theta = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+        return float(math.degrees(math.acos(cos_theta)))
 
 
 # NOT: Bu dosya bilinçli olarak saf bir Python modülüdür (backend/servis
