@@ -418,25 +418,10 @@ class CorridorDataCollector:
         return nodes
 
 
-# ------------------------------------------------------------------ #
-# Örnek Kullanım (Bağımsız çalıştırma testi için)
-# ------------------------------------------------------------------ #
-
-if __name__ == "__main__":
-    # Örnek: Çorum bölgesinde iki nokta arasında test amaçlı bir koridor.
-    collector = CorridorDataCollector(
-        start=GeoPoint(lat=40.5506, lon=34.9556),
-        end=GeoPoint(lat=40.5650, lon=34.9700),
-        corridor_buffer_m=150.0,   # Koridor genişliği: A-B hattının her iki yanına 150m
-        node_spacing_m=40.0,       # Her 40 metrede bir aday direk düğümü
-    )
-
-    data = collector.run()
-
-    print(f"\nÜretilen sanal düğüm sayısı: {len(data.virtual_nodes)}")
-    for node in data.virtual_nodes[:5]:
-        print(
-            f"  Node #{node.node_id}: "
-            f"lat={node.point.lat:.6f}, lon={node.point.lon:.6f}, "
-            f"mesafe={node.cumulative_distance_m:.1f}m"
-        )
+# NOT: Bu dosya bilinçli olarak saf bir Python modülüdür (backend/servis
+# katmanı) ve içinde Streamlit arayüz kodu YOKTUR. Bu yüzden Streamlit'in
+# "main module" (ana dosya) olarak DOĞRUDAN deploy edilmemelidir — deploy
+# edilirse ekranda hiçbir arayüz elemanı görünmez (boş sayfa) ve olası bir
+# ağ gecikmesinde uygulama asılı kalabilir.
+#
+# Bu modülü kullanan gerçek Streamlit uygulaması için bkz. app.py.
