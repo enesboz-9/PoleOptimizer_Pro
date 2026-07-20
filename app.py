@@ -32,12 +32,239 @@ segment üzerinde etiket olarak da görüntülenir.
 import streamlit as st
 import folium
 import osmnx as ox
+from branca.element import MacroElement, Template
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 
 from corridor_data_collector import CorridorDataCollector, GeoPoint, haversine_distance_m
 
 st.set_page_config(page_title="PoleOptimizer Pro", layout="wide")
+
+
+class SketchLineTools(MacroElement):
+    """Kroki haritasına 3 ekstra araç ekler (saf Leaflet/JS, sunucuya gitmez):
+
+    1) 🎯 Çizime Odaklan  -> çizilmiş tüm çizgilerin sınırlarına otomatik
+       zoom/pan yapar (harita köşesindeki buton).
+    2) ✂️ Çizgiyi Kırp    -> araç aktifken haritaya tıklandığında, tıklanan
+       noktaya en yakın çizginin, tıklanan noktaya en yakın UCU o noktaya
+       kadar kısaltılır (trim).
+    3) Otomatik uç birleştirme -> yeni çizilen bir çizginin ucu, mevcut bir
+       çizginin ucuna (piksel bazlı bir eşiğin içinde) denk gelirse iki
+       çizgi otomatik olarak TEK bir çizgide birleştirilir. Çizim sırasında
+       imleç böyle bir uca yaklaşınca yeşil bir halka ile "🔗 Birleştirilecek"
+       ipucu gösterilir.
+    """
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function() {
+            var map = {{ this._parent.get_name() }};
+            var fg = {{ this.feature_group_var }};
+            var SNAP_PX = {{ this.snap_px }};
+            var TRIM_PX = {{ this.trim_px }};
+
+            // ---------- 1) Otomatik odaklama butonu ----------
+            var focusCtrl = L.control({position: 'topright'});
+            focusCtrl.onAdd = function() {
+                var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+                div.innerHTML = '<a href="#" title="Çizime odaklan" ' +
+                    'style="font-size:18px;line-height:30px;text-align:center;' +
+                    'width:30px;height:30px;display:block;background:#fff;">🎯</a>';
+                L.DomEvent.disableClickPropagation(div);
+                L.DomEvent.on(div, 'click', function(e) {
+                    L.DomEvent.preventDefault(e);
+                    if (fg.getLayers().length > 0) {
+                        map.fitBounds(fg.getBounds(), {padding: [40, 40]});
+                    }
+                });
+                return div;
+            };
+            focusCtrl.addTo(map);
+
+            // ---------- 2) Çizgi kırpma (trim) butonu ----------
+            var trimActive = false;
+            var trimCtrl = L.control({position: 'topleft'});
+            var trimLink;
+            trimCtrl.onAdd = function() {
+                var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+                trimLink = L.DomUtil.create('a', '', div);
+                trimLink.href = '#';
+                trimLink.title = 'Çizgiyi kırp (tıklanan noktaya en yakın ucu kısaltır)';
+                trimLink.innerHTML = '✂️';
+                trimLink.style.cssText = 'font-size:16px;line-height:30px;' +
+                    'text-align:center;width:30px;height:30px;display:block;background:#fff;';
+                L.DomEvent.disableClickPropagation(div);
+                L.DomEvent.on(trimLink, 'click', function(e) {
+                    L.DomEvent.preventDefault(e);
+                    trimActive = !trimActive;
+                    trimLink.style.background = trimActive ? '#ffca28' : '#fff';
+                    map.getContainer().style.cursor = trimActive ? 'crosshair' : '';
+                });
+                return div;
+            };
+            trimCtrl.addTo(map);
+
+            function toPx(latlng) { return map.latLngToLayerPoint(latlng); }
+
+            function nearestOnLine(latlngs, clickLatLng) {
+                var p = toPx(clickLatLng);
+                var pts = latlngs.map(toPx);
+                var segLens = [];
+                var totalLen = 0;
+                for (var i = 0; i < pts.length - 1; i++) {
+                    var segLen = pts[i].distanceTo(pts[i + 1]);
+                    segLens.push(segLen);
+                    totalLen += segLen;
+                }
+                var best = null, running = 0;
+                for (var i = 0; i < pts.length - 1; i++) {
+                    var a = pts[i], b = pts[i + 1];
+                    var l2 = (b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y);
+                    var t = 0;
+                    if (l2 > 0) {
+                        t = ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / l2;
+                        t = Math.max(0, Math.min(1, t));
+                    }
+                    var proj = {x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y)};
+                    var dx = p.x - proj.x, dy = p.y - proj.y;
+                    var distSq = dx * dx + dy * dy;
+                    if (best === null || distSq < best.distSq) {
+                        best = {distSq: distSq, segIndex: i, t: t, cumDist: running + t * segLens[i]};
+                    }
+                    running += segLens[i];
+                }
+                if (best === null) return null;
+                best.distPx = Math.sqrt(best.distSq);
+                best.totalLen = totalLen;
+                return best;
+            }
+
+            map.on('click', function(e) {
+                if (!trimActive) return;
+                var bestLayer = null, bestInfo = null;
+                fg.eachLayer(function(layer) {
+                    if (!(layer instanceof L.Polyline) || layer instanceof L.Polygon) return;
+                    var latlngs = layer.getLatLngs();
+                    if (!Array.isArray(latlngs) || latlngs.length < 2 || Array.isArray(latlngs[0])) return;
+                    var info = nearestOnLine(latlngs, e.latlng);
+                    if (info && info.distPx < TRIM_PX && (!bestInfo || info.distPx < bestInfo.distPx)) {
+                        bestLayer = layer; bestInfo = info;
+                    }
+                });
+                if (!bestLayer) return;
+                var latlngs = bestLayer.getLatLngs();
+                var i = bestInfo.segIndex, t = bestInfo.t;
+                var a = latlngs[i], b = latlngs[i + 1];
+                var cutPoint = L.latLng(a.lat + (b.lat - a.lat) * t, a.lng + (b.lng - a.lng) * t);
+                var newLatLngs;
+                if (bestInfo.cumDist < bestInfo.totalLen / 2) {
+                    newLatLngs = [cutPoint].concat(latlngs.slice(i + 1));
+                } else {
+                    newLatLngs = latlngs.slice(0, i + 1).concat([cutPoint]);
+                }
+                if (newLatLngs.length >= 2) {
+                    bestLayer.setLatLngs(newLatLngs);
+                }
+            });
+
+            // ---------- 3) Çizim sırasında yakın uca "birleştirilecek" ipucu ----------
+            var snapMarker = null;
+            function clearSnap() {
+                if (snapMarker) { map.removeLayer(snapMarker); snapMarker = null; }
+            }
+            function onDrawMouseMove(e) {
+                var cursorPx = toPx(e.latlng);
+                var found = null;
+                fg.eachLayer(function(layer) {
+                    if (!(layer instanceof L.Polyline) || layer instanceof L.Polygon) return;
+                    var latlngs = layer.getLatLngs();
+                    if (!Array.isArray(latlngs) || latlngs.length < 2 || Array.isArray(latlngs[0])) return;
+                    [latlngs[0], latlngs[latlngs.length - 1]].forEach(function(endpoint) {
+                        var d = cursorPx.distanceTo(toPx(endpoint));
+                        if (d < SNAP_PX && (!found || d < found.dist)) {
+                            found = {latlng: endpoint, dist: d};
+                        }
+                    });
+                });
+                if (found) {
+                    if (!snapMarker) {
+                        snapMarker = L.circleMarker(found.latlng, {
+                            radius: 9, color: '#43a047', weight: 3, fill: false
+                        }).addTo(map);
+                        snapMarker.bindTooltip('🔗 Birleştirilecek', {
+                            permanent: true, direction: 'top', offset: [0, -8]
+                        }).openTooltip();
+                    } else {
+                        snapMarker.setLatLng(found.latlng);
+                    }
+                } else {
+                    clearSnap();
+                }
+            }
+            map.on('draw:drawstart', function(e) {
+                if (e.layerType === 'polyline') map.on('mousemove', onDrawMouseMove);
+            });
+            map.on('draw:drawstop', function() {
+                map.off('mousemove', onDrawMouseMove);
+                clearSnap();
+            });
+
+            // ---------- 4) Uç uca yakın gelen iki çizgiyi otomatik birleştir ----------
+            function closeEnough(a, b) {
+                return toPx(a).distanceTo(toPx(b)) < SNAP_PX;
+            }
+            map.on('draw:created', function(e) {
+                if (e.layerType !== 'polyline') return;
+                clearSnap();
+                var newLayer = e.layer;
+                var newLatLngs = newLayer.getLatLngs();
+                if (!Array.isArray(newLatLngs) || newLatLngs.length < 2) return;
+                var merged = false;
+                fg.eachLayer(function(existing) {
+                    if (merged || existing === newLayer) return;
+                    if (!(existing instanceof L.Polyline) || existing instanceof L.Polygon) return;
+                    var exLatLngs = existing.getLatLngs();
+                    if (!Array.isArray(exLatLngs) || exLatLngs.length < 2 || Array.isArray(exLatLngs[0])) return;
+                    var exStart = exLatLngs[0], exEnd = exLatLngs[exLatLngs.length - 1];
+                    var newStart = newLatLngs[0], newEnd = newLatLngs[newLatLngs.length - 1];
+                    var combined = null;
+                    if (closeEnough(exEnd, newStart)) {
+                        combined = exLatLngs.concat(newLatLngs.slice(1));
+                    } else if (closeEnough(exStart, newEnd)) {
+                        combined = newLatLngs.concat(exLatLngs.slice(1));
+                    } else if (closeEnough(exEnd, newEnd)) {
+                        combined = exLatLngs.concat(newLatLngs.slice().reverse().slice(1));
+                    } else if (closeEnough(exStart, newStart)) {
+                        combined = exLatLngs.slice().reverse().concat(newLatLngs.slice(1));
+                    }
+                    if (combined) {
+                        existing.setLatLngs(combined);
+                        merged = true;
+                    }
+                });
+                if (merged) {
+                    // Yeni çizilen küçük parça, mevcut çizgiyle birleştirildiği
+                    // için ayrı bir katman olarak tutulmasına gerek yok.
+                    setTimeout(function() { fg.removeLayer(newLayer); }, 0);
+                }
+            });
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self, feature_group_var, snap_px=20, trim_px=18):
+        super().__init__()
+        self._name = "SketchLineTools"
+        # Raw JS variable name (string), e.g. "drawnItems_<draw_ctrl.get_name()>" —
+        # NOT a folium object. The pinned folium/Draw version creates its own
+        # internal FeatureGroup and doesn't expose a `feature_group` constructor
+        # argument, so we reference that internal variable by name instead.
+        self.feature_group_var = feature_group_var
+        self.snap_px = snap_px
+        self.trim_px = trim_px
 
 
 def geocode_place(query: str):
@@ -187,7 +414,13 @@ if input_mode == "sketch":
         "bitirin. Çiziminiz eğik, yamuk ya da tam yol üzerinde olmasa bile "
         "sorun değil — uygulama sizin anlatmak istediğiniz hattı en yakın "
         "gerçek yol ağına oturtacak. Gerekirse kalem simgesinin yanındaki "
-        "düzenleme/silme araçlarıyla çizimi düzeltebilirsiniz."
+        "düzenleme/silme araçlarıyla çizimi düzeltebilirsiniz.\n\n"
+        "**Yeni araçlar:** ✂️ (sol üst) çizgi kırpma aracını açar — aktifken "
+        "haritaya tıkladığınızda en yakın çizginin, tıkladığınız noktaya en "
+        "yakın ucu o noktaya kadar kısaltılır. Yeni bir çizgiyi mevcut bir "
+        "çizginin ucuna yakın bitirirseniz (imleç yeşil 🔗 halkayla bunu "
+        "gösterir), iki çizgi otomatik olarak tek bir hatta birleştirilir. "
+        "🎯 (sağ üst) ise çizdiğiniz tüm hatta otomatik olarak odaklanır/zum yapar."
     )
 
     use_direct_line = st.checkbox(
@@ -214,7 +447,7 @@ if input_mode == "sketch":
     draw_map = folium.Map(
         location=[center_lat, center_lon], zoom_start=zoom_level, tiles="OpenStreetMap"
     )
-    Draw(
+    draw_ctrl = Draw(
         export=False,
         draw_options={
             "polyline": {"shapeOptions": {"color": "#e91e63", "weight": 4}},
@@ -225,6 +458,15 @@ if input_mode == "sketch":
             "circlemarker": False,
         },
         edit_options={"edit": True, "remove": True},
+    )
+    draw_ctrl.add_to(draw_map)
+    # Draw plugin, doğrudan bir FeatureGroup nesnesi almıyor (bu folium/Draw
+    # sürümünde `feature_group` parametresi yok); kendi içinde
+    # `drawnItems_<draw_ctrl_adı>` isimli bir JS değişkeni oluşturuyor.
+    # SketchLineTools'a da bu aynı JS değişkeninin adını veriyoruz ki aynı
+    # katman üzerinde çalışsın.
+    SketchLineTools(
+        feature_group_var=f"drawnItems_{draw_ctrl.get_name()}"
     ).add_to(draw_map)
 
     draw_result = st_folium(
@@ -235,6 +477,14 @@ if input_mode == "sketch":
         returned_objects=["all_drawings"],
     )
 
+    def _line_length_m(coords_lonlat):
+        total = 0.0
+        for (lon1, lat1), (lon2, lat2) in zip(coords_lonlat, coords_lonlat[1:]):
+            total += haversine_distance_m(
+                GeoPoint(lat=lat1, lon=lon1), GeoPoint(lat=lat2, lon=lon2)
+            )
+        return total
+
     sketch_coords_lonlat = None
     if draw_result:
         drawings = draw_result.get("all_drawings") or []
@@ -242,20 +492,29 @@ if input_mode == "sketch":
             d for d in drawings if d.get("geometry", {}).get("type") == "LineString"
         ]
         if line_drawings:
-            # Kullanıcı birden fazla çizgi çizmiş olabilir; en son çizileni kullan.
-            sketch_coords_lonlat = line_drawings[-1]["geometry"]["coordinates"]
+            # Otomatik uç-birleştirme sayesinde genelde tek bir çizgi kalır;
+            # yine de birden fazla ayrık çizgi varsa en son çizileni değil,
+            # en UZUN olanı kullan (birleştirilmiş asıl güzergah tipik olarak
+            # en uzun olandır; küçük yanlışlıkla bırakılmış çiziklerden etkilenmez).
+            line_drawings.sort(
+                key=lambda d: _line_length_m(d["geometry"]["coordinates"]), reverse=True
+            )
+            sketch_coords_lonlat = line_drawings[0]["geometry"]["coordinates"]
 
-    if sketch_coords_lonlat and len(sketch_coords_lonlat) >= 2:
-        st.success(f"✅ Çizim algılandı: {len(sketch_coords_lonlat)} nokta. Hesaplamaya hazır.")
-        sketch_points = [GeoPoint(lat=lat, lon=lon) for lon, lat in sketch_coords_lonlat]
-    else:
-        st.info("Henüz bir çizgi çizilmedi. Haritadan bir hat çizin.")
-
-    run_button = st.button(
-        "🚀 Bu Çizimden Direkleri Hesapla",
-        type="primary",
-        disabled=sketch_points is None,
-    )
+    status_col, action_col = st.columns([3, 1], vertical_alignment="center")
+    with status_col:
+        if sketch_coords_lonlat and len(sketch_coords_lonlat) >= 2:
+            st.success(f"✅ Çizim algılandı: {len(sketch_coords_lonlat)} nokta. Hesaplamaya hazır.")
+            sketch_points = [GeoPoint(lat=lat, lon=lon) for lon, lat in sketch_coords_lonlat]
+        else:
+            st.info("Henüz bir çizgi çizilmedi. Haritadan bir hat çizin.")
+    with action_col:
+        run_button = st.button(
+            "🚀 Direkleri Hesapla",
+            type="primary",
+            disabled=sketch_points is None,
+            use_container_width=True,
+        )
 else:
     run_button = st.button("🚀 Koridor Verisini Getir", type="primary")
 
