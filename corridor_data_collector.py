@@ -665,6 +665,14 @@ class CorridorDataCollector:
         bağlanıyor) içermez. Rota (en kısa yol) hesaplamak için gerçek
         bir graf yapısı (`ox.graph_from_polygon`) gerekir.
 
+        `network_type="all"` kullanılır (sadece "drive" değil): kroki,
+        araç yolu olmayan alanlardan (yaya yolu, avlu, park içi patika,
+        servis yolu vb.) geçebilir. Sadece "drive" kullanılsaydı, bu tür
+        bölgelerdeki kroki noktalarının çoğu en yakın (uzaktaki) tek bir
+        sokağa yapışıp aynı düğümde toplanır; bu da rotanın pratikte
+        sadece başlangıç-bitiş arası kısa bir sokak parçasına inmesine
+        (ara noktaların "yutulmasına") yol açar.
+
         Args:
             corridor_polygon: Yol ağının çekileceği alan (WGS84).
 
@@ -675,7 +683,7 @@ class CorridorDataCollector:
         try:
             graph = ox.graph_from_polygon(
                 corridor_polygon,
-                network_type="drive",
+                network_type="all",
                 simplify=True,
                 retain_all=True,
             )
