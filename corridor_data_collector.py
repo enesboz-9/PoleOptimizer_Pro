@@ -326,8 +326,10 @@ class CorridorDataCollector:
             raise ValueError("node_spacing_m sıfırdan büyük olmalıdır.")
         if pole_offset_m < 0:
             raise ValueError("pole_offset_m negatif olamaz.")
-        if offset_side not in ("left", "right"):
-            raise ValueError("offset_side yalnızca 'left' veya 'right' olabilir.")
+        if offset_side not in ("left", "right", "auto"):
+            raise ValueError(
+                "offset_side yalnızca 'left', 'right' veya 'auto' olabilir."
+            )
         if voltage_class not in self.VOLTAGE_SPAN_LIMITS_M:
             raise ValueError(
                 f"voltage_class yalnızca {list(self.VOLTAGE_SPAN_LIMITS_M)} "
@@ -355,9 +357,12 @@ class CorridorDataCollector:
         # kadar bir yaklaşıklıktır.
         self.pole_offset_m = pole_offset_m
         # offset_side: Yürüyüş yönüne (A'dan B'ye) göre hangi tarafa
-        # offsetleneceği. Gerçek projede bu, YEDAŞ'ın mülkiyet/irtifak
-        # hakkı bulunan taraf gibi saha bilgisine göre seçilmelidir;
-        # şu an için sabit bir varsayılan sunuyoruz.
+        # offsetleneceği. "left"/"right" sabit bir tercihtir. "auto"
+        # verilirse (ve bir kroki/referans hat varsa), direkler kullanıcının
+        # FİİLEN çizdiği/işaret ettiği tarafa otomatik olarak yerleştirilir
+        # — bkz. `_infer_offset_side`. Gerçek projede sabit tercih, YEDAŞ'ın
+        # mülkiyet/irtifak hakkı bulunan taraf gibi saha bilgisine göre
+        # seçilmelidir.
         self.offset_side = offset_side
 
         # A-B hattının orta noktasına göre en uygun UTM projeksiyonunu seç.
@@ -581,6 +586,9 @@ class CorridorDataCollector:
         if direct_line_mode and sketch_points and len(sketch_points) >= 2:
             direct_line_utm = self._sketch_points_to_utm_line(sketch_points)
             if direct_line_utm is not None:
+                # Doğrudan çizim modunda rota == kroki hattının kendisi,
+                # bu yüzden "auto" bir referans farkı bulamaz (mesafe ~0);
+                # bu durumda sabit bir varsayılana ("right") düşülür.
                 nodes = self._place_poles_along_route(direct_line_utm, roads_gdf)
                 logger.info(
                     "Doğrudan çizim modu: direkler kroki üzerinde üretildi "
@@ -601,12 +609,20 @@ class CorridorDataCollector:
                     road_graph, sketch_points
                 )
                 route_source = "sketch_matched"
+                # "auto" offset yönü için referans: kullanıcının ham
+                # kroki hattı (map-matching sonrası oturtulmuş rotanın
+                # KENDİSİ değil) — böylece direkler kullanıcının fiilen
+                # çizdiği/işaret ettiği tarafa yerleştirilebilir.
+                reference_line_utm = self._sketch_points_to_utm_line(sketch_points)
             else:
                 route_line_utm = self._compute_road_route_utm(road_graph)
                 route_source = "road_snapped"
+                reference_line_utm = None
 
             if route_line_utm is not None:
-                nodes = self._place_poles_along_route(route_line_utm, roads_gdf)
+                nodes = self._place_poles_along_route(
+                    route_line_utm, roads_gdf, reference_line_utm=reference_line_utm
+                )
                 return nodes, route_source
 
         logger.warning(
@@ -618,7 +634,14 @@ class CorridorDataCollector:
         start_xy = np.array(self.to_utm.transform(*self.start.as_xy()))
         end_xy = np.array(self.to_utm.transform(*self.end.as_xy()))
         straight_line_utm = LineString([tuple(start_xy), tuple(end_xy)])
-        nodes = self._place_poles_along_route(straight_line_utm, roads_gdf)
+        fallback_reference = (
+            self._sketch_points_to_utm_line(sketch_points)
+            if sketch_points and len(sketch_points) >= 2
+            else None
+        )
+        nodes = self._place_poles_along_route(
+            straight_line_utm, roads_gdf, reference_line_utm=fallback_reference
+        )
         return nodes, "straight_line_fallback"
 
     def _resample_line_utm(
@@ -1012,6 +1035,68 @@ class CorridorDataCollector:
             return (1.0, 0.0)
         return (dx / length, dy / length)
 
+    def _infer_offset_side(
+        self,
+        route_line_utm: LineString,
+        reference_line_utm: LineString,
+        samples: int = 15,
+    ) -> str:
+        """`offset_side="auto"` için: direklerin, rotanın hangi tarafına
+        (rotanın kendi yerel yönüne göre "left" ya da "right") offsetleneceğini,
+        kullanıcının ÇİZDİĞİ ham kroki hattına (`reference_line_utm`) göre
+        otomatik olarak belirler.
+
+        Neden gerekli: `route_line_utm` (map-matching sonrası yol ağına
+        oturtulmuş/eşleştirilmiş rota) ile kullanıcının fiilen çizdiği kroki
+        hattı aynı çizgi değildir — map-matching, krokiyi en yakın yolun
+        ORTA HATTINA oturtur. Sabit bir "left"/"right" tercihi bu orta hatta
+        göre uygulanırsa, hangi tarafın kullanıcının çizdiği (ve genelde yol
+        kenarı/kaldırım olarak kastedilen) tarafa denk geldiği güzergahın
+        yönüne göre değişir; bu da direklerin bazen yolun YANLIŞ tarafına
+        (kullanıcının çizmediği tarafa) düşmesine yol açabilir. Bu metot,
+        rota boyunca birden fazla noktada kroki hattına olan dik yönü
+        örnekleyip çoğunluk oyuyla tutarlı TEK bir taraf seçer.
+
+        Args:
+            route_line_utm: Direklerin üretileceği rota (UTM), örn.
+                map-matching sonrası yol ağına oturtulmuş hat.
+            reference_line_utm: Karşılaştırma referansı — kullanıcının ham
+                kroki hattı (UTM).
+            samples: Rota boyunca alınacak örnek nokta sayısı.
+
+        Returns:
+            "left" ya da "right".
+        """
+        if route_line_utm.length < 1e-6:
+            return "right"
+
+        left_votes = 0
+        right_votes = 0
+        for i in range(samples):
+            s = route_line_utm.length * (i + 0.5) / samples
+            route_pt = route_line_utm.interpolate(s)
+            tangent = self._route_tangent_at(route_line_utm, route_pt)
+            ref_s = reference_line_utm.project(route_pt)
+            ref_pt = reference_line_utm.interpolate(ref_s)
+            vec = (ref_pt.x - route_pt.x, ref_pt.y - route_pt.y)
+            vec_len = math.hypot(*vec)
+            if vec_len < 1e-6:
+                continue
+            # "left" tarafın normali: tanjantın +90° döndürülmüş hali.
+            left_perp = (-tangent[1], tangent[0])
+            dot = vec[0] * left_perp[0] + vec[1] * left_perp[1]
+            if dot >= 0:
+                left_votes += 1
+            else:
+                right_votes += 1
+
+        chosen = "left" if left_votes >= right_votes else "right"
+        logger.info(
+            "Otomatik offset yönü belirlendi: %s (sol oy: %d, sağ oy: %d)",
+            chosen, left_votes, right_votes,
+        )
+        return chosen
+
     def _snap_point_to_road_edge(
         self,
         point_utm: Point,
@@ -1097,6 +1182,7 @@ class CorridorDataCollector:
         self,
         route_line_utm: LineString,
         roads_gdf: gpd.GeoDataFrame,
+        reference_line_utm: Optional[LineString] = None,
     ) -> List[VirtualNode]:
         """Direk noktalarını, rotayı HİÇ değiştirmeden/kısaltmadan üretir
         ve her birini ayrı ayrı en yakın gerçek yolun kenarına yapıştırır.
@@ -1138,6 +1224,10 @@ class CorridorDataCollector:
                 koordinatlarında (kroki/eşleştirme/en kısa yol/düz hat).
             roads_gdf: `_fetch_osm_layer` ile çekilen ham yol katmanı
                 (WGS84).
+            reference_line_utm: `offset_side="auto"` iken kullanılacak
+                referans hat (tipik olarak kullanıcının ham kroki hattı,
+                UTM). None ise ve `offset_side="auto"` seçilmişse, güvenli
+                bir varsayılana ("right") düşülür ve durum loglanır.
 
         Returns:
             node_id sırasına göre sıralı, her biri en yakın yol kenarına
@@ -1154,7 +1244,19 @@ class CorridorDataCollector:
 
         # Shapely offset_curve sözleşmesiyle tutarlı olacak şekilde:
         # "left" -> tanjantın soluna (+90°), "right" -> sağına (-90°).
-        signed_side = 1.0 if self.offset_side == "left" else -1.0
+        if self.offset_side == "auto":
+            if reference_line_utm is not None and reference_line_utm.length > 1e-6:
+                effective_side = self._infer_offset_side(route_line_utm, reference_line_utm)
+            else:
+                effective_side = "right"
+                logger.warning(
+                    "offset_side='auto' seçildi ancak karşılaştırılacak bir "
+                    "referans hat (kroki) yok; güvenli varsayılan 'right' "
+                    "kullanılıyor."
+                )
+        else:
+            effective_side = self.offset_side
+        signed_side = 1.0 if effective_side == "left" else -1.0
 
         snapped_count = 0
         rejected_count = 0
