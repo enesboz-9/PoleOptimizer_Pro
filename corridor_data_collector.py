@@ -610,35 +610,46 @@ class CorridorDataCollector:
         # araç yönü zaten anlamsızdır.
         route_graph = road_graph.to_undirected()
 
-        full_route_nodes: List[int] = [waypoint_nodes[0]]
-        skipped_segments = 0
+        # ÖNEMLİ: rota her zaman "şu ana kadar ulaşılan gerçek son düğüm"
+        # (current_node) üzerinden bir sonraki waypoint'e aranır — orijinal
+        # waypoint çiftleri (i, i+1) üzerinden DEĞİL. Aksi halde bir ara
+        # segment rotasız kalırsa (örn. bağlantısız bir yol parçası), bir
+        # sonraki deneme rotanın gerçek ucundan değil "atlanan" waypoint'ten
+        # başlardı; bu da iki bağlantısız düğüm dizisinin uç uca eklenip
+        # aralarında görünmez bir "ışınlanma" (kopuk/hayalet) segmenti
+        # oluşmasına ve nihai hattın büyük ölçüde kısalmasına yol açardı.
+        current_node = waypoint_nodes[0]
+        full_route_nodes: List[int] = [current_node]
+        skipped_waypoints = 0
 
-        for i in range(len(waypoint_nodes) - 1):
-            origin, dest = waypoint_nodes[i], waypoint_nodes[i + 1]
-            try:
-                sub_path = nx.shortest_path(route_graph, origin, dest, weight="length")
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
-                # Bu ara segment bağlantısız kalmış olabilir (örn. krokinin
-                # bir kısmı yol ağı dışına taştı); atla ve bir sonraki
-                # yakalanan noktadan devam et. Rotanın tamamını iptal
-                # etmiyoruz çünkü kullanıcının çizdiği hattın büyük kısmı
-                # hâlâ geçerli olabilir.
-                skipped_segments += 1
+        for target in waypoint_nodes[1:]:
+            if target == current_node:
                 continue
-            # sub_path[0] zaten full_route_nodes'un son elemanına eşit
-            # (origin) olduğundan tekrar eklenmiyor.
+            try:
+                sub_path = nx.shortest_path(route_graph, current_node, target, weight="length")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                # Bu waypoint şu anki uçtan ulaşılamaz durumda (örn.
+                # krokinin bir kısmı yol ağı dışına taştı); bu waypoint'i
+                # atla ama current_node'u DEĞİŞTİRME — bir sonraki
+                # waypoint'e yine rotanın gerçek son noktasından
+                # ulaşmayı dene. Böylece süreklilik hiç bozulmaz.
+                skipped_waypoints += 1
+                continue
+            # sub_path[0] zaten current_node'a eşit olduğundan tekrar
+            # eklenmiyor.
             full_route_nodes.extend(sub_path[1:])
+            current_node = target
 
         if len(full_route_nodes) < 2:
             logger.warning("Kroki hattı yol ağı üzerinde bir rotaya dönüştürülemedi.")
             return None
 
-        if skipped_segments:
+        if skipped_waypoints:
             logger.warning(
-                "Kroki eşleştirmesinde %d ara segment bağlantısız yol ağı "
-                "nedeniyle atlandı; rota bir sonraki yakalanan noktadan "
-                "devam etti.",
-                skipped_segments,
+                "Kroki eşleştirmesinde %d waypoint, rotanın o anki ucundan "
+                "ulaşılamadığı için atlandı; süreklilik korunarak devam "
+                "edildi.",
+                skipped_waypoints,
             )
 
         coords_utm: List[Tuple[float, float]] = []
