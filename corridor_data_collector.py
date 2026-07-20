@@ -35,6 +35,7 @@ try:
     import networkx as nx
     from shapely.geometry import Point, LineString, Polygon, MultiLineString
     from shapely.ops import transform as shapely_transform
+    from shapely.strtree import STRtree
     import pyproj
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
@@ -364,7 +365,7 @@ class CorridorDataCollector:
         # kroki + eşleştirme modu ise map-matching, kroki yoksa en kısa
         # yol, hiçbiri olmazsa düz hat ---
         virtual_nodes, route_source = self._compute_virtual_nodes(
-            corridor_polygon_wgs84, sketch_points, direct_line_mode
+            corridor_polygon_wgs84, roads_gdf, sketch_points, direct_line_mode
         )
 
         corridor_data = CorridorData(
@@ -471,6 +472,7 @@ class CorridorDataCollector:
     def _compute_virtual_nodes(
         self,
         corridor_polygon: Polygon,
+        roads_gdf: gpd.GeoDataFrame,
         sketch_points: Optional[List[GeoPoint]] = None,
         direct_line_mode: bool = False,
     ) -> Tuple[List[VirtualNode], str]:
@@ -486,13 +488,22 @@ class CorridorDataCollector:
         kroki hattını gerçek yol ağına eşleştirmeyi (map-matching) dener.
         Verilmemişse (ya da eşleştirme başarısız olursa) A ve B arasında
         yol ağı üzerinden en kısa rotayı bulmayı dener (yollardan geçen,
-        köşelerde dönen, kaldırım kenarına offsetlenmiş direk dizisi). Bu
-        da başarısız olursa (yol ağı bulunamadı, uç noktalar bir yola
-        yakın değil, bağlantısız graf vb.) düz hatta geri döner ve bunu
-        log'da açıkça belirtir.
+        köşelerde dönen direk dizisi). Bu da başarısız olursa (yol ağı
+        bulunamadı, uç noktalar bir yola yakın değil, bağlantısız graf
+        vb.) düz hatta geri döner ve bunu log'da açıkça belirtir.
+
+        ÖNEMLİ: Hangi rota kaynağı seçilirse seçilsin, rotanın KENDİSİ
+        (çizilen/eşleştirilen hat) hiçbir zaman değiştirilmez ya da
+        kısaltılmaz — direkler bu rotanın üzerinde üretilir, ardından her
+        biri ayrı ayrı en yakın gerçek yolun KENARINA yapıştırılır (bkz.
+        `_place_poles_along_route`). Eskiden olduğu gibi tüm rota tek
+        seferde sabit bir mesafeyle kaydırılmaz.
 
         Args:
             corridor_polygon: OSM yol ağının çekileceği alan (WGS84).
+            roads_gdf: `_fetch_osm_layer` ile çekilen ham yol katmanı
+                (WGS84) — her direğin en yakın yol kenarına
+                yapıştırılması için kullanılır.
             sketch_points: Varsa, kullanıcının kalemle çizdiği kroki
                 hattının WGS84 noktaları (A'dan B'ye sırayla).
             direct_line_mode: True ise ve `sketch_points` verilmişse,
@@ -507,11 +518,10 @@ class CorridorDataCollector:
         if direct_line_mode and sketch_points and len(sketch_points) >= 2:
             direct_line_utm = self._sketch_points_to_utm_line(sketch_points)
             if direct_line_utm is not None:
-                offset_line_utm = self._offset_route_line(direct_line_utm)
-                nodes = self._generate_nodes_along_line(offset_line_utm)
+                nodes = self._place_poles_along_route(direct_line_utm, roads_gdf)
                 logger.info(
-                    "Doğrudan çizim modu: direkler kroki üzerine (yol "
-                    "ağına oturtulmadan) yerleştirildi | %d düğüm.",
+                    "Doğrudan çizim modu: direkler kroki üzerinde üretildi "
+                    "ve (varsa) en yakın yol kenarına yapıştırıldı | %d düğüm.",
                     len(nodes),
                 )
                 return nodes, "sketch_direct"
@@ -533,8 +543,7 @@ class CorridorDataCollector:
                 route_source = "road_snapped"
 
             if route_line_utm is not None:
-                offset_line_utm = self._offset_route_line(route_line_utm)
-                nodes = self._generate_nodes_along_line(offset_line_utm)
+                nodes = self._place_poles_along_route(route_line_utm, roads_gdf)
                 return nodes, route_source
 
         logger.warning(
@@ -546,7 +555,7 @@ class CorridorDataCollector:
         start_xy = np.array(self.to_utm.transform(*self.start.as_xy()))
         end_xy = np.array(self.to_utm.transform(*self.end.as_xy()))
         straight_line_utm = LineString([tuple(start_xy), tuple(end_xy)])
-        nodes = self._generate_nodes_along_line(straight_line_utm)
+        nodes = self._place_poles_along_route(straight_line_utm, roads_gdf)
         return nodes, "straight_line_fallback"
 
     def _resample_line_utm(
@@ -847,82 +856,254 @@ class CorridorDataCollector:
         )
         return LineString(coords_utm)
 
-    # Offset sonucu, orijinal rotanın bu oranından daha kısa çıkarsa
-    # (örn. keskin köşeli/döngüsel bir kroki üzerinde offset_curve'ün
-    # kendi kendine kesişip küçük bir parçaya "çökmesi" durumunda),
-    # offset güvenilmez sayılır ve offsetsiz orijinal hatta geri dönülür.
-    # Bu olmadan, tüm krokinin (örn. büyük bir mahalle turu gibi
-    # döngüsel bir hat) yalnızca başlangıca yakın minik bir parçaya
-    # indirgenip geri kalan tüm düğümlerin sessizce kaybolması mümkündü.
-    MIN_OFFSET_LENGTH_RATIO = 0.6
+    # Bir düğüm noktasının "yol kenarına yapıştırılmış" sayılabilmesi için
+    # en yakın OSM yoluna olan mesafesinin üst sınırı (metre). Koridor
+    # tamponu geniş olduğunda, krokinin bir tarlanın/ormanın içinden
+    # geçtiği kısa bir kesitte bile `roads_gdf` içinde uzakta bir yol
+    # bulunabilir; bu sınırın ötesindeki yollar o düğüm için "yakında yol
+    # yok" kabul edilir — aksi halde direk, çizilen hattan onlarca/
+    # yüzlerce metre uzağa "ışınlanabilir".
+    MAX_ROAD_SNAP_DISTANCE_M = 25.0
 
-    def _offset_route_line(self, route_line_utm: LineString) -> LineString:
-        """Rota çizgisini, direklerin yolun ORTASINDA değil KENARINDA
-        durması için `pole_offset_m` kadar yana kaydırır (offset).
+    def _prepare_road_lines_utm(
+        self, roads_gdf: gpd.GeoDataFrame
+    ) -> List[LineString]:
+        """`roads_gdf` (WGS84) içindeki geometrileri UTM'e çevirip yalnızca
+        çizgisel (LineString) yol geometrilerinin düz bir listesini üretir.
 
-        "round" (yuvarlak) birleşim stili kullanılır: "mitre" (gönye)
-        stili köşeleri geometrik olarak daha keskin korusa da, elle
-        çizilmiş (freehand) krokilerde sık rastlanan keskin/dar açılarda
-        çok uzun "iğne" (spike) uçları üretip GEOS'un offset sonucunu
-        kendi kendine kesişen, parçalanmış bir MultiLineString'e
-        dönüştürmesine yol açabiliyordu — bu da en uzun parçanın bile
-        orijinal hattın çok küçük bir kesiti olmasına (dolayısıyla
-        çizilen hattın büyük kısmının "kaybolmasına") sebep olabiliyordu.
-        "round" stili böyle spike'lar üretmediği için çok daha kararlıdır;
-        bedeli, köşelerin gönye yerine hafifçe yuvarlak olmasıdır ki bu
-        direk yerleşimi hassasiyeti için ihmal edilebilir.
-
-        Buna ek olarak, offset sonucu yine de orijinal hattan anormal
-        derecede kısa çıkarsa (`MIN_OFFSET_LENGTH_RATIO` altına düşerse),
-        sonuç güvenilmez kabul edilip offsetsiz orijinal hatta dönülür.
+        OSMnx `features_from_polygon`, bazen alansal (örn. meydan
+        poligonu) ya da nokta (örn. bariyer düğümü) geometrileri de
+        döndürebilir; bunlar kenar-yapıştırma (edge snapping) için
+        anlamsız olduğundan filtrelenir. `MultiLineString`'ler tekil
+        `LineString` parçalarına ayrıştırılır (explode) — böylece her
+        parça için ayrı ayrı en yakın nokta/yön hesabı yapılabilir.
 
         Args:
-            route_line_utm: Yol ağından elde edilen orijinal (orta hat)
-                rota, UTM koordinatlarında.
+            roads_gdf: `_fetch_osm_layer` ile çekilen ham yol katmanı.
 
         Returns:
-            Offsetlenmiş LineString. Offset başarısız ya da anormal
-            derecede kısa çıkarsa, güvenli fallback olarak offsetsiz
-            orijinal rota döner.
+            UTM koordinatlarında LineString listesi (yol yoksa boş liste).
         """
-        if self.pole_offset_m == 0:
-            return route_line_utm
-
-        original_length = route_line_utm.length
-
-        # Shapely offset_curve sözleşmesi: pozitif mesafe, çizginin
-        # A->B yönüne göre SOLUNA offsetler; negatif mesafe SAĞINA.
-        signed_offset = self.pole_offset_m if self.offset_side == "left" else -self.pole_offset_m
+        if roads_gdf is None or roads_gdf.empty:
+            return []
 
         try:
-            offset_geom = route_line_utm.offset_curve(signed_offset, join_style="round")
-            if offset_geom.is_empty:
-                raise ValueError("Offset sonucu boş geometri döndü.")
-            if isinstance(offset_geom, MultiLineString):
-                # Karmaşık/kendisiyle kesişen rotalarda offset birden
-                # fazla parçaya bölünebilir; en uzun parçayı ana rota
-                # olarak kabul ediyoruz.
-                offset_geom = max(offset_geom.geoms, key=lambda g: g.length)
-
-            if (
-                original_length > 0
-                and offset_geom.length < self.MIN_OFFSET_LENGTH_RATIO * original_length
-            ):
-                logger.warning(
-                    "Offset sonucu orijinal rotadan çok daha kısa çıktı "
-                    "(%.1fm -> %.1fm); offset güvenilmez kabul edilip "
-                    "offsetsiz orijinal hatta geri dönülüyor.",
-                    original_length, offset_geom.length,
-                )
-                return route_line_utm
-
-            return offset_geom
+            roads_utm = roads_gdf.to_crs(self.utm_epsg)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Rota offsetlenirken sorun oluştu, offsetsiz orta hat "
-                "kullanılacak: %s", exc
+                "Yol katmanı UTM'e çevrilirken sorun oluştu, kenar "
+                "yapıştırma bu düğümler için atlanacak: %s", exc
             )
-            return route_line_utm
+            return []
+
+        lines: List[LineString] = []
+        for geom in roads_utm.geometry:
+            if geom is None or geom.is_empty:
+                continue
+            if isinstance(geom, LineString):
+                lines.append(geom)
+            elif isinstance(geom, MultiLineString):
+                lines.extend(list(geom.geoms))
+            # Polygon/Point vb. diğer (nadir) geometri tipleri atlanır.
+
+        return lines
+
+    def _route_tangent_at(
+        self, route_line_utm: LineString, point_utm: Point
+    ) -> Tuple[float, float]:
+        """Rotanın, verilen noktaya en yakın konumundaki yerel yön
+        (tanjant) birim vektörünü sayısal türevle hesaplar.
+
+        Args:
+            route_line_utm: Orijinal (offsetlenmemiş) rota, UTM.
+            point_utm: Rota üzerinde (ya da tam üzerinde kabul edilecek
+                kadar yakınında) bir nokta.
+
+        Returns:
+            (dx, dy) birim tanjant vektörü. Dejenere durumlarda (sıfır
+            uzunluklu rota vb.) varsayılan olarak (1.0, 0.0) döner.
+        """
+        s = route_line_utm.project(point_utm)
+        delta = 0.5
+        s_back = max(0.0, s - delta)
+        s_fwd = min(route_line_utm.length, s + delta)
+        if s_fwd - s_back < 1e-6:
+            return (1.0, 0.0)
+
+        p_back = route_line_utm.interpolate(s_back)
+        p_fwd = route_line_utm.interpolate(s_fwd)
+        dx, dy = p_fwd.x - p_back.x, p_fwd.y - p_back.y
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            return (1.0, 0.0)
+        return (dx / length, dy / length)
+
+    def _snap_point_to_road_edge(
+        self,
+        point_utm: Point,
+        road_lines: List[LineString],
+        road_tree: "STRtree",
+        route_perp_unit: Tuple[float, float],
+    ) -> Tuple[Point, bool]:
+        """Tek bir aday direk noktasını en yakın gerçek yolun KENARINA
+        yapıştırır.
+
+        Yolun OSM'de hangi yönde çizildiği (digitization direction)
+        bilinemediğinden, yolun iki olası dikey (normal) yönünden hangisi
+        seçilecek diye `route_perp_unit` (rotanın o noktadaki yerel
+        yönüne dik, `offset_side` tarafını gösteren birim vektör) ile
+        karşılaştırılır — böylece direkler, yolun rastgele bir yönde
+        sıçramak yerine, rotanın tutarlı bir tarafında (örn. hep aynı
+        kaldırım kenarında) kalır.
+
+        Args:
+            point_utm: Rotanın orijinal (kaydırılmamış) hattı üzerindeki
+                aday direk noktası (UTM).
+            road_lines: `_prepare_road_lines_utm` çıktısı.
+            road_tree: `road_lines` üzerine kurulmuş STRtree (hızlı en
+                yakın yol araması için).
+            route_perp_unit: Rotanın bu noktadaki yerel dikeyinin,
+                `offset_side` tarafını gösteren birim vektörü (x, y).
+
+        Returns:
+            (yeni_nokta, yapıştırıldı_mı) tuple'ı. Yakında
+            (`MAX_ROAD_SNAP_DISTANCE_M` içinde) bir yol bulunamazsa,
+            `yapıştırıldı_mı=False` ile birlikte rotanın kendi yerel
+            dikeyine göre sabit offsetlenmiş nokta döner (güvenli
+            fallback — eski davranışla aynı).
+        """
+        fallback_point = Point(
+            point_utm.x + route_perp_unit[0] * self.pole_offset_m,
+            point_utm.y + route_perp_unit[1] * self.pole_offset_m,
+        )
+
+        if not road_lines or road_tree is None:
+            return fallback_point, False
+
+        nearest_idx = road_tree.nearest(point_utm)
+        nearest_road = road_lines[int(nearest_idx)]
+
+        if nearest_road.distance(point_utm) > self.MAX_ROAD_SNAP_DISTANCE_M:
+            return fallback_point, False
+
+        s = nearest_road.project(point_utm)
+        nearest_on_road = nearest_road.interpolate(s)
+
+        # Yol segmentinin bu noktadaki yerel yönünü (tanjant), küçük bir
+        # ileri/geri adımla (delta) sayısal türev alarak buluyoruz.
+        delta = 0.5
+        s_back = max(0.0, s - delta)
+        s_fwd = min(nearest_road.length, s + delta)
+        if s_fwd - s_back < 1e-6:
+            return fallback_point, False
+
+        p_back = nearest_road.interpolate(s_back)
+        p_fwd = nearest_road.interpolate(s_fwd)
+        road_dx, road_dy = p_fwd.x - p_back.x, p_fwd.y - p_back.y
+        road_len = math.hypot(road_dx, road_dy)
+        if road_len < 1e-9:
+            return fallback_point, False
+        road_dx, road_dy = road_dx / road_len, road_dy / road_len
+
+        # Yolun iki olası dikey (normal) yönünden, rotanın istenen
+        # tarafına (route_perp_unit) daha yakın olanı seçilir.
+        perp_a = (-road_dy, road_dx)
+        perp_b = (road_dy, -road_dx)
+        dot_a = perp_a[0] * route_perp_unit[0] + perp_a[1] * route_perp_unit[1]
+        dot_b = perp_b[0] * route_perp_unit[0] + perp_b[1] * route_perp_unit[1]
+        chosen_perp = perp_a if dot_a >= dot_b else perp_b
+
+        snapped_point = Point(
+            nearest_on_road.x + chosen_perp[0] * self.pole_offset_m,
+            nearest_on_road.y + chosen_perp[1] * self.pole_offset_m,
+        )
+        return snapped_point, True
+
+    def _place_poles_along_route(
+        self,
+        route_line_utm: LineString,
+        roads_gdf: gpd.GeoDataFrame,
+    ) -> List[VirtualNode]:
+        """Direk noktalarını, rotayı HİÇ değiştirmeden/kısaltmadan üretir
+        ve her birini ayrı ayrı en yakın gerçek yolun kenarına yapıştırır.
+
+        Önceki yaklaşım (bkz. eski `_offset_route_line`), tüm rota
+        çizgisini tek seferde sabit bir mesafeyle (`pole_offset_m`)
+        kaydırıyordu. Bu, özellikle kullanıcının serbest çizdiği krokinin
+        gerçek yoldan saptığı kısımlarında, direği yolun gerçek kenarına
+        değil "krokinin X metre yanına" koyuyordu.
+
+        Bu metot bunun yerine:
+          1. Direk noktalarını DOĞRUDAN orijinal (kaydırılmamış) rota
+             üzerinde, `node_spacing_m` aralıklarla üretir — rota hiçbir
+             zaman kısaltılmaz/değiştirilmez; köşe noktaları korunur.
+          2. Her nokta için `roads_gdf` içindeki en yakın gerçek yol
+             segmentini bulur, noktayı o segmentin üzerine izdüşürür
+             (nearest point) ve segmentin yerel yönüne dik olarak
+             `pole_offset_m` kadar kaydırarak yolun KENARINA yerleştirir.
+          3. Yakınında (bkz. `MAX_ROAD_SNAP_DISTANCE_M`) hiçbir yol
+             bulunamazsa, o nokta rotanın kendi yerel dikeyine göre sabit
+             offsetlenir (güvenli fallback) — direk asla çizilen hattan
+             anlamsız derecede uzağa sıçramaz.
+
+        Args:
+            route_line_utm: Orijinal (offsetlenmemiş) rota, UTM
+                koordinatlarında (kroki/eşleştirme/en kısa yol/düz hat).
+            roads_gdf: `_fetch_osm_layer` ile çekilen ham yol katmanı
+                (WGS84).
+
+        Returns:
+            node_id sırasına göre sıralı, her biri en yakın yol kenarına
+            yapıştırılmış (ya da yakında yol yoksa güvenli fallback ile
+            offsetlenmiş) VirtualNode listesi.
+        """
+        raw_nodes = self._generate_nodes_along_line(route_line_utm)
+
+        if self.pole_offset_m == 0:
+            return raw_nodes
+
+        road_lines = self._prepare_road_lines_utm(roads_gdf)
+        road_tree = STRtree(road_lines) if road_lines else None
+
+        # Shapely offset_curve sözleşmesiyle tutarlı olacak şekilde:
+        # "left" -> tanjantın soluna (+90°), "right" -> sağına (-90°).
+        signed_side = 1.0 if self.offset_side == "left" else -1.0
+
+        snapped_count = 0
+        placed_nodes: List[VirtualNode] = []
+
+        for node in raw_nodes:
+            x, y = self.to_utm.transform(node.point.lon, node.point.lat)
+            point_utm = Point(x, y)
+
+            tangent = self._route_tangent_at(route_line_utm, point_utm)
+            route_perp = (-tangent[1] * signed_side, tangent[0] * signed_side)
+
+            new_point, did_snap = self._snap_point_to_road_edge(
+                point_utm, road_lines, road_tree, route_perp
+            )
+            if did_snap:
+                snapped_count += 1
+
+            lon, lat = self.to_wgs84.transform(new_point.x, new_point.y)
+            placed_nodes.append(
+                VirtualNode(
+                    node_id=node.node_id,
+                    point=GeoPoint(lat=lat, lon=lon),
+                    cumulative_distance_m=node.cumulative_distance_m,
+                    span_length_m=node.span_length_m,
+                    is_corner=node.is_corner,
+                )
+            )
+
+        logger.info(
+            "Yol kenarına yapıştırma tamamlandı | %d/%d düğüm gerçek yol "
+            "kenarına yapıştırıldı (kalanlar, yakında yol bulunamadığı "
+            "için rota-dikeyine sabit offsetlendi).",
+            snapped_count, len(placed_nodes),
+        )
+
+        return placed_nodes
 
     def _generate_nodes_along_line(self, line_utm: LineString) -> List[VirtualNode]:
         """Verilen (offsetlenmiş) rota çizgisi üzerinde sanal direk
