@@ -367,7 +367,24 @@ with st.sidebar:
 
     st.subheader("Koridor Ayarları")
     buffer_m = st.slider("Koridor genişliği (m)", 50, 500, 150, step=10)
-    spacing_m = st.slider("Direk aralığı / span (m)", 20, 100, 40, step=5)
+
+    voltage_class = st.selectbox(
+        "Gerilim sınıfı",
+        options=list(CorridorDataCollector.VOLTAGE_SPAN_LIMITS_M.keys()),
+        format_func=lambda v: "AG (0.4 kV)" if v == "AG" else "OG (34.5 kV)",
+        help=(
+            "Seçilen sınıfa göre azami açıklık (span) sınırlanır. Bu "
+            "değerler tipik saha pratiğine dayanan YAKLAŞIK üst "
+            "sınırlardır; TEDAŞ'ın güncel projelendirme şartnamesi ve "
+            "onaylı statik hesap ile teyit edilmelidir."
+        ),
+    )
+    max_span_for_class = CorridorDataCollector.VOLTAGE_SPAN_LIMITS_M[voltage_class]
+    spacing_m = st.slider(
+        "Direk aralığı / span (m)",
+        20, int(max_span_for_class), min(40, int(max_span_for_class)), step=5,
+        help=f"{voltage_class} sınıfı için yaklaşık azami açıklık: {max_span_for_class:.0f} m.",
+    )
 
     st.subheader("Direk Konumlandırma")
     offset_m = st.slider(
@@ -534,6 +551,7 @@ if run_button:
                     node_spacing_m=float(spacing_m),
                     pole_offset_m=float(offset_m),
                     offset_side=offset_side,
+                    voltage_class=voltage_class,
                 )
                 data = collector.run(
                     sketch_points=sketch_points,
@@ -547,9 +565,12 @@ if run_button:
                     node_spacing_m=float(spacing_m),
                     pole_offset_m=float(offset_m),
                     offset_side=offset_side,
+                    voltage_class=voltage_class,
                 )
                 data = collector.run()
             st.session_state["corridor_data"] = data
+            st.session_state["max_span_m"] = collector.max_span_m
+            st.session_state["voltage_class_used"] = collector.voltage_class
         except Exception as exc:  # noqa: BLE001
             st.error(f"Veri toplama sırasında bir hata oluştu: {exc}")
             st.session_state.pop("corridor_data", None)
@@ -583,16 +604,37 @@ else:
             "geçebilir; sonuç yalnızca kaba bir ön izlemedir."
         )
 
-    num_corners = sum(1 for n in data.virtual_nodes if n.is_corner)
+    num_angle = sum(1 for n in data.virtual_nodes if n.pole_type == "açı")
+    num_end = sum(1 for n in data.virtual_nodes if n.pole_type == "nihayet")
 
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Bina Sayısı", len(data.buildings_gdf))
     col2.metric("Engel Poligonu", len(data.obstacles_gdf))
     col3.metric("Yol Segmenti", len(data.roads_gdf))
     col4.metric("Sanal Düğüm", len(data.virtual_nodes))
-    col5.metric("Köşe/Kavşak Direği", num_corners)
+    col5.metric("Açı / Nihayet Direği", f"{num_angle} / {num_end}")
 
-    st.caption("💡 Haritadaki herhangi bir direk simgesine **tıklayarak** koordinatlarını görebilirsiniz.")
+    _max_span = st.session_state.get("max_span_m")
+    _voltage_used = st.session_state.get("voltage_class_used")
+    if _max_span is not None:
+        _over_limit = [
+            n for n in data.virtual_nodes if n.span_length_m > _max_span + 1e-6
+        ]
+        if _over_limit:
+            st.warning(
+                f"⚠️ {len(_over_limit)} direğin açıklığı, seçilen gerilim "
+                f"sınıfının ({_voltage_used}) yaklaşık azami açıklığını "
+                f"({_max_span:.0f} m) aşıyor — genelde köşe/vertex "
+                "noktalarında kaçınılmazdır, projelendirme aşamasında "
+                "ayrıca değerlendirilmelidir."
+            )
+
+    st.caption(
+        "💡 Haritadaki herhangi bir direk simgesine **tıklayarak** "
+        "koordinatlarını görebilirsiniz. Direk tipi (nihayet / açı / ara) "
+        "kaba bir ön çalışma sınıflamasıdır, TEDAŞ onaylı projelendirmenin "
+        "yerine geçmez."
+    )
 
     show_span_distances = st.checkbox(
         "📏 Direkler arası mesafeyi haritada göster",
@@ -678,27 +720,45 @@ else:
             tooltip="Sizin çiziminiz (ham kroki)",
         ).add_to(fmap)
 
+    pole_type_style = {
+        "nihayet": ("#9467bd", "🟣 Nihayet Direği", 8),
+        "açı": ("#d62728", "🔴 Açı Direği", 7),
+        "ara": ("#1f77b4", "🔵 Ara Direk", 4),
+    }
+    max_span_for_run = st.session_state.get("max_span_m")
+
     prev_node = None
     for node in data.virtual_nodes:
-        is_corner = node.is_corner
-        label = "🔴 Köşe/Kavşak Direği" if is_corner else "🔵 Ara Direk"
+        color, label, radius = pole_type_style.get(
+            node.pole_type, pole_type_style["ara"]
+        )
+        span_exceeds = (
+            max_span_for_run is not None
+            and node.span_length_m > max_span_for_run + 1e-6
+        )
         popup_html = (
             f"<b>{label} #{node.node_id}</b><br>"
             f"Enlem (lat): {node.point.lat:.6f}<br>"
             f"Boylam (lon): {node.point.lon:.6f}<br>"
             f"A'dan mesafe: {node.cumulative_distance_m:.0f} m<br>"
             + (
+                f"Sapma açısı: {node.deflection_angle_deg:.0f}°<br>"
+                if node.is_corner and node.node_id > 0
+                else ""
+            )
+            + (
                 f"Önceki direğe mesafe: {node.span_length_m:.0f} m"
+                + (" ⚠️ azami açıklığı aşıyor" if span_exceeds else "")
                 if node.node_id > 0
                 else "Önceki direk yok (başlangıç)"
             )
         )
         folium.CircleMarker(
             [node.point.lat, node.point.lon],
-            radius=7 if is_corner else 4,
-            color="#d62728" if is_corner else "#1f77b4",
+            radius=radius,
+            color="#ff9800" if span_exceeds else color,
             fill=True,
-            fill_opacity=0.9 if is_corner else 0.8,
+            fill_opacity=0.9 if node.is_corner else 0.8,
             tooltip=f"{label} #{node.node_id} ({node.cumulative_distance_m:.0f}m) — koordinat için tıklayın",
             popup=folium.Popup(popup_html, max_width=250),
         ).add_to(fmap)
