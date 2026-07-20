@@ -23,12 +23,48 @@ değil, click) koordinatları bir popup içinde gösterilir.
 
 import streamlit as st
 import folium
+import osmnx as ox
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 
 from corridor_data_collector import CorridorDataCollector, GeoPoint
 
 st.set_page_config(page_title="PoleOptimizer Pro", layout="wide")
+
+
+def geocode_place(query: str):
+    """İl/ilçe/köy/mahalle/adres metnini OSM Nominatim üzerinden
+    (lat, lon) koordinatına çevirir.
+
+    Türkiye'deki küçük yerleşimlerde (köy, mahalle) belirsizliği azaltmak
+    için sorguya otomatik olarak ", Türkiye" eklenir (kullanıcı zaten bir
+    ülke adı yazmadıysa).
+
+    Args:
+        query: Kullanıcının yazdığı yer adı (örn. "Bafra", "Görele köyü,
+            Amasya").
+
+    Returns:
+        (lat, lon) tuple'ı, ya da konum bulunamazsa/hata oluşursa None.
+    """
+    query = query.strip()
+    if not query:
+        return None
+    if "türkiye" not in query.lower() and "turkey" not in query.lower():
+        query = f"{query}, Türkiye"
+    try:
+        lat, lon = ox.geocode(query)
+        return lat, lon
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# Harita merkezi, arama kutusuyla güncellenebilmesi için session_state'te
+# tutulur (varsayılan: Çorum/Bahçelievler civarı — mevcut örnek verilerle
+# aynı bölge).
+st.session_state.setdefault("map_center_lat", 40.5578)
+st.session_state.setdefault("map_center_lon", 34.9628)
+st.session_state.setdefault("map_zoom", 16)
 
 st.title("⚡ PoleOptimizer Pro")
 st.caption("Modül 1 Test Arayüzü: Koridor Veri Toplama & Sanal Düğüm Üretimi")
@@ -38,6 +74,39 @@ st.caption("Modül 1 Test Arayüzü: Koridor Veri Toplama & Sanal Düğüm Üret
 # ------------------------------------------------------------------ #
 with st.sidebar:
     st.header("Girdi Parametreleri")
+
+    st.subheader("🔍 Konum Ara")
+    st.caption("İl, ilçe, köy, mahalle veya adres yazıp haritayı o konuma taşıyın.")
+    search_col1, search_col2 = st.columns([3, 1])
+    with search_col1:
+        search_query = st.text_input(
+            "Konum Ara",
+            placeholder="Örn: Bafra, Samsun ya da Görele köyü",
+            label_visibility="collapsed",
+            key="location_search_query",
+        )
+    with search_col2:
+        search_clicked = st.button("Ara", use_container_width=True)
+
+    if search_clicked:
+        if not search_query.strip():
+            st.warning("Lütfen bir yer adı yazın.")
+        else:
+            with st.spinner(f"'{search_query}' aranıyor..."):
+                result = geocode_place(search_query)
+            if result is None:
+                st.error(
+                    "Bu konum bulunamadı. Daha spesifik yazmayı deneyin "
+                    "(örn. 'Köy adı, İlçe adı, İl adı')."
+                )
+            else:
+                st.session_state["map_center_lat"] = result[0]
+                st.session_state["map_center_lon"] = result[1]
+                st.session_state["map_zoom"] = 14
+                st.success(f"📍 Bulundu: {result[0]:.5f}, {result[1]:.5f}")
+                st.rerun()
+
+    st.divider()
 
     st.subheader("Giriş Yöntemi")
     input_mode = st.radio(
@@ -56,9 +125,10 @@ with st.sidebar:
         end_lon = st.number_input("B - Boylam (lon)", value=34.9700, format="%.6f")
     else:
         st.subheader("Harita Merkezi (Çizim İçin)")
-        center_lat = st.number_input("Merkez - Enlem (lat)", value=40.5578, format="%.6f")
-        center_lon = st.number_input("Merkez - Boylam (lon)", value=34.9628, format="%.6f")
-        zoom_level = st.slider("Yakınlaştırma", 12, 19, 16)
+        st.caption("Yukarıdan bir yer arayabilir ya da aşağıdan elle ayarlayabilirsiniz.")
+        center_lat = st.number_input("Merkez - Enlem (lat)", format="%.6f", key="map_center_lat")
+        center_lon = st.number_input("Merkez - Boylam (lon)", format="%.6f", key="map_center_lon")
+        zoom_level = st.slider("Yakınlaştırma", 12, 19, key="map_zoom")
 
     st.subheader("Koridor Ayarları")
     buffer_m = st.slider("Koridor genişliği (m)", 50, 500, 150, step=10)
@@ -79,6 +149,26 @@ with st.sidebar:
 # Ana alan: giriş yöntemine göre çizim haritası ya da doğrudan buton
 # ------------------------------------------------------------------ #
 sketch_points = None
+
+if input_mode == "manual":
+    with st.expander("🗺️ Aranan konumu haritada göster / koordinat bul", expanded=True):
+        st.caption(
+            "Sol panelden bir yer aradıysanız harita o konuma gelir. Haritada "
+            "istediğiniz noktaya **tıklayarak** koordinatlarını görüp A/B "
+            "alanlarına kopyalayabilirsiniz."
+        )
+        locator_map = folium.Map(
+            location=[st.session_state["map_center_lat"], st.session_state["map_center_lon"]],
+            zoom_start=st.session_state["map_zoom"],
+            tiles="OpenStreetMap",
+        )
+        folium.Marker(
+            [st.session_state["map_center_lat"], st.session_state["map_center_lon"]],
+            tooltip="Aranan konum",
+            icon=folium.Icon(color="blue", icon="search"),
+        ).add_to(locator_map)
+        locator_map.add_child(folium.LatLngPopup())
+        st_folium(locator_map, width=None, height=400, returned_objects=[], key="locator_map")
 
 if input_mode == "sketch":
     st.subheader("✏️ Kroki: Hattı Kalemle Çizin")
