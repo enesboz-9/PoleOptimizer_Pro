@@ -84,6 +84,10 @@ class VirtualNode:
         point: Düğümün coğrafi konumu (WGS84).
         cumulative_distance_m: A noktasından bu düğüme kadar olan
             kümülatif mesafe (metre, Haversine bazlı).
+        span_length_m: Bir önceki direkten (node_id - 1) bu direğe kadar
+            olan mesafe (metre) — yani bu direkle bir önceki direk
+            arasındaki "açıklık/span" uzunluğu. İlk düğüm (A, node_id=0)
+            için 0.0'dır (önceki düğüm yoktur).
         is_feasible: Kısıt kontrolünden geçip geçmediği (varsayılan None
             = henüz kontrol edilmedi).
         elevation_m: DEM'den okunacak yükseklik (varsayılan None,
@@ -100,6 +104,7 @@ class VirtualNode:
     node_id: int
     point: GeoPoint
     cumulative_distance_m: float
+    span_length_m: float = 0.0
     is_feasible: Optional[bool] = None
     elevation_m: Optional[float] = None
     blocking_reason: Optional[str] = None
@@ -130,7 +135,16 @@ class CorridorData:
                 (eğik/yamuk olabilen) kroki hattı, gerçek OSM yol ağına
                 harita-eşleştirme (map-matching) ile oturtuldu ve
                 direkler bu eşleştirilmiş rotanın kenarına offsetlendi
-                (tercih edilen, en gerçekçi durum).
+                (tercih edilen, en gerçekçi durum — yol/patika verisi
+                olan güzergahlarda).
+            "sketch_direct" -> kullanıcı yol ağına oturtmayı bilinçli
+                olarak devre dışı bıraktı (`direct_line_mode=True`);
+                direkler kullanıcının çizdiği krokinin KENDİSİ üzerine
+                (varsa offsetlenerek) yerleştirildi. OSM'de yol/patika
+                verisi olmayan orman, arazi, mesire alanı gibi
+                güzergahlarda kullanılır — bu bölgelerde map-matching
+                tüm ara noktaları en yakın dış yola "çökertip" hattı
+                anlamsızlaştırabildiği için tercih edilir.
             "straight_line_fallback" -> yol ağı bulunamadı/rota
                 hesaplanamadı, A-B (ya da kroki uç noktaları) düz hattına
                 geri dönüldü (bu durumda sonuçlar binaların/engellerin
@@ -301,7 +315,11 @@ class CorridorDataCollector:
     # Public API
     # -------------------------------------------------------------- #
 
-    def run(self, sketch_points: Optional[List[GeoPoint]] = None) -> CorridorData:
+    def run(
+        self,
+        sketch_points: Optional[List[GeoPoint]] = None,
+        direct_line_mode: bool = False,
+    ) -> CorridorData:
         """Tüm veri toplama ve sanal düğüm üretim akışını çalıştırır.
 
         Args:
@@ -314,6 +332,17 @@ class CorridorDataCollector:
                 (örn. belirli bir sokaktan geçme niyeti) korunur.
                 None ise (varsayılan), eski davranış korunur: A ve B
                 arasında yol ağı üzerinden en kısa rota aranır.
+            direct_line_mode: True verilirse (ve `sketch_points` en az 2
+                nokta içeriyorsa), yol ağına oturtma (map-matching) HİÇ
+                denenmez; direkler doğrudan kullanıcının çizdiği kroki
+                üzerine (yalnızca `pole_offset_m` kadar yana kaydırılmış
+                olarak) yerleştirilir. OSM'de yol/patika verisi olmayan
+                orman, arazi, mesire alanı gibi güzergahlarda kullanılır
+                — map-matching bu tür alanlarda tüm ara noktaları en
+                yakın dış yola "çökertip" hattı anlamsızlaştırabilir.
+                `sketch_points` verilmemişse bu parametrenin bir etkisi
+                yoktur (manuel A/B modunda zaten oturtulacak bir kroki
+                yoktur).
 
         Returns:
             Bina, engel, yol katmanlarını, koridor poligonunu ve
@@ -331,10 +360,11 @@ class CorridorDataCollector:
             corridor_polygon_wgs84, self.ROAD_TAGS, layer_name="roads"
         )
 
-        # --- Rota hesaplama: kroki varsa eşleştir, yoksa en kısa yol,
-        # ikisi de olmazsa düz hat ---
+        # --- Rota hesaplama: kroki + doğrudan mod ise hattın kendisi,
+        # kroki + eşleştirme modu ise map-matching, kroki yoksa en kısa
+        # yol, hiçbiri olmazsa düz hat ---
         virtual_nodes, route_source = self._compute_virtual_nodes(
-            corridor_polygon_wgs84, sketch_points
+            corridor_polygon_wgs84, sketch_points, direct_line_mode
         )
 
         corridor_data = CorridorData(
@@ -442,27 +472,54 @@ class CorridorDataCollector:
         self,
         corridor_polygon: Polygon,
         sketch_points: Optional[List[GeoPoint]] = None,
+        direct_line_mode: bool = False,
     ) -> Tuple[List[VirtualNode], str]:
         """Sanal direk düğümlerini üretmenin ana orkestrasyon metodu.
 
-        `sketch_points` verilmişse önce kroki hattını gerçek yol ağına
-        eşleştirmeyi (map-matching) dener. Verilmemişse (ya da eşleştirme
-        başarısız olursa) A ve B arasında yol ağı üzerinden en kısa rotayı
-        bulmayı dener (yollardan geçen, köşelerde dönen, kaldırım kenarına
-        offsetlenmiş direk dizisi). Bu da başarısız olursa (yol ağı
-        bulunamadı, uç noktalar bir yola yakın değil, bağlantısız graf
-        vb.) düz hatta geri döner ve bunu log'da açıkça belirtir.
+        `direct_line_mode=True` ve bir kroki verilmişse, yol ağına
+        oturtma (map-matching) HİÇ denenmez; direkler doğrudan kullanıcının
+        çizdiği hat üzerine yerleştirilir ("sketch_direct"). Bu, OSM'de
+        yol/patika verisi olmayan orman/arazi güzergahları için
+        tasarlanmıştır.
+
+        Aksi halde (varsayılan davranış): `sketch_points` verilmişse önce
+        kroki hattını gerçek yol ağına eşleştirmeyi (map-matching) dener.
+        Verilmemişse (ya da eşleştirme başarısız olursa) A ve B arasında
+        yol ağı üzerinden en kısa rotayı bulmayı dener (yollardan geçen,
+        köşelerde dönen, kaldırım kenarına offsetlenmiş direk dizisi). Bu
+        da başarısız olursa (yol ağı bulunamadı, uç noktalar bir yola
+        yakın değil, bağlantısız graf vb.) düz hatta geri döner ve bunu
+        log'da açıkça belirtir.
 
         Args:
             corridor_polygon: OSM yol ağının çekileceği alan (WGS84).
             sketch_points: Varsa, kullanıcının kalemle çizdiği kroki
                 hattının WGS84 noktaları (A'dan B'ye sırayla).
+            direct_line_mode: True ise ve `sketch_points` verilmişse,
+                map-matching atlanır ve direkler doğrudan kroki üzerine
+                yerleştirilir.
 
         Returns:
             (virtual_nodes, route_source) tuple'ı. route_source,
-            "sketch_matched", "road_snapped" veya
+            "sketch_matched", "sketch_direct", "road_snapped" veya
             "straight_line_fallback" değerlerinden birini alır.
         """
+        if direct_line_mode and sketch_points and len(sketch_points) >= 2:
+            direct_line_utm = self._sketch_points_to_utm_line(sketch_points)
+            if direct_line_utm is not None:
+                offset_line_utm = self._offset_route_line(direct_line_utm)
+                nodes = self._generate_nodes_along_line(offset_line_utm)
+                logger.info(
+                    "Doğrudan çizim modu: direkler kroki üzerine (yol "
+                    "ağına oturtulmadan) yerleştirildi | %d düğüm.",
+                    len(nodes),
+                )
+                return nodes, "sketch_direct"
+            logger.warning(
+                "Doğrudan çizim modu için kroki noktaları anlamlı bir "
+                "hat oluşturamadı; düz hatta geri dönülüyor."
+            )
+
         road_graph = self._fetch_road_graph(corridor_polygon)
 
         if road_graph is not None:
@@ -522,6 +579,44 @@ class CorridorDataCollector:
         points = [line_utm.interpolate(d) for d in distances]
         return [(p.x, p.y) for p in points]
 
+    def _sketch_points_to_utm_line(
+        self, sketch_points: List[GeoPoint]
+    ) -> Optional[LineString]:
+        """Kullanıcının kalemle çizdiği ham kroki noktalarını, bitişik/
+        tekrarlı ardışık noktaları sadeleştirerek bir UTM LineString'e
+        çevirir.
+
+        Bu, hem map-matching (`_match_sketch_to_road_graph`) hem de
+        doğrudan-çizim modu (`_compute_virtual_nodes` içindeki
+        `direct_line_mode` dalı) tarafından ortak olarak kullanılır —
+        çizim aracının çift-tıklama ile bitirilen son noktada bıraktığı
+        neredeyse-çakışık fazladan vertex'i (< 0.5m) her iki yolda da
+        aynı şekilde temizlemek için.
+
+        Args:
+            sketch_points: Kroki hattının WGS84 noktaları, A'dan B'ye.
+
+        Returns:
+            Sadeleştirilmiş UTM LineString, ya da anlamlı bir hat
+            oluşmazsa (örn. tüm noktalar birbirine çok yakınsa) None.
+        """
+        if len(sketch_points) < 2:
+            return None
+
+        sketch_coords_utm = [self.to_utm.transform(*p.as_xy()) for p in sketch_points]
+
+        deduped_coords_utm: List[Tuple[float, float]] = [sketch_coords_utm[0]]
+        for x, y in sketch_coords_utm[1:]:
+            last_x, last_y = deduped_coords_utm[-1]
+            if math.hypot(x - last_x, y - last_y) >= 0.5:
+                deduped_coords_utm.append((x, y))
+
+        if len(deduped_coords_utm) < 2:
+            logger.warning("Kroki noktaları birbirine çok yakın; anlamlı bir çizgi oluşmadı.")
+            return None
+
+        return LineString(deduped_coords_utm)
+
     def _match_sketch_to_road_graph(
         self, road_graph: nx.MultiDiGraph, sketch_points: List[GeoPoint]
     ) -> Optional[LineString]:
@@ -552,26 +647,14 @@ class CorridorDataCollector:
             ya da eşleştirme hiçbir şekilde başarılamazsa None (bu
             durumda çağıran taraf düz hatta geri döner).
         """
-        if len(sketch_points) < 2:
-            return None
-
-        sketch_coords_utm = [self.to_utm.transform(*p.as_xy()) for p in sketch_points]
-
         # Çizim aracı, son noktayı bitirmek için çift tıklama gerektirir;
         # bu genelde aynı (ya da bir-iki piksel kaymış) koordinatta fazladan
         # bir vertex bırakır. Böyle bitişik/tekrarlı ardışık noktaları
         # (< 0.5m) sadeleştiriyoruz, aksi halde sıfır uzunluklu son
         # segment örneklemeyi ve eşleştirmeyi bozabilir.
-        deduped_coords_utm: List[Tuple[float, float]] = [sketch_coords_utm[0]]
-        for x, y in sketch_coords_utm[1:]:
-            last_x, last_y = deduped_coords_utm[-1]
-            if math.hypot(x - last_x, y - last_y) >= 0.5:
-                deduped_coords_utm.append((x, y))
-        if len(deduped_coords_utm) < 2:
-            logger.warning("Kroki noktaları birbirine çok yakın; anlamlı bir çizgi oluşmadı.")
+        sketch_line_utm = self._sketch_points_to_utm_line(sketch_points)
+        if sketch_line_utm is None:
             return None
-
-        sketch_line_utm = LineString(deduped_coords_utm)
 
         # Kullanıcının çizdiği köşeleri kaçırmamak için node_spacing_m'den
         # bağımsız, sabitçe sık bir örnekleme aralığı kullanılır (10-25m).
@@ -839,10 +922,12 @@ class CorridorDataCollector:
                 node_id=node_id,
                 point=GeoPoint(lat=first_lat, lon=first_lon),
                 cumulative_distance_m=0.0,
+                span_length_m=0.0,  # A ucu: önceki direk yok.
                 is_corner=True,
             )
         )
         node_id += 1
+        prev_cumulative_distance = 0.0
 
         for i in range(len(coords) - 1):
             p1 = np.array(coords[i])
@@ -870,10 +955,14 @@ class CorridorDataCollector:
                         node_id=node_id,
                         point=GeoPoint(lat=lat, lon=lon),
                         cumulative_distance_m=round(cumulative_distance_at_point, 3),
+                        span_length_m=round(
+                            cumulative_distance_at_point - prev_cumulative_distance, 3
+                        ),
                         is_corner=is_corner_point,
                     )
                 )
                 node_id += 1
+                prev_cumulative_distance = cumulative_distance_at_point
 
             cumulative_distance += segment_length
 
