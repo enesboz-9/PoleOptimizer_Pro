@@ -35,7 +35,7 @@ import osmnx as ox
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 
-from corridor_data_collector import CorridorDataCollector, GeoPoint
+from corridor_data_collector import CorridorDataCollector, GeoPoint, haversine_distance_m
 
 st.set_page_config(page_title="PoleOptimizer Pro", layout="wide")
 
@@ -344,6 +344,44 @@ else:
             "popup'ında da bir önceki direğe olan mesafe zaten yer alır."
         ),
     )
+
+    with st.expander("🔧 Teşhis Bilgisi (sorun bildirirken bu bölümü paylaşın)"):
+        raw_sketch_len_m = None
+        if sketch_points and len(sketch_points) >= 2:
+            raw_sketch_len_m = sum(
+                haversine_distance_m(sketch_points[i], sketch_points[i + 1])
+                for i in range(len(sketch_points) - 1)
+            )
+        computed_route_len_m = (
+            data.virtual_nodes[-1].cumulative_distance_m if data.virtual_nodes else 0.0
+        )
+        st.json({
+            "input_mode": input_mode,
+            "direct_line_mode_secildi_mi": (
+                use_direct_line if input_mode == "sketch" else "n/a (manuel mod)"
+            ),
+            "route_source": data.route_source,
+            "cizilen_kroki_nokta_sayisi": len(sketch_points) if sketch_points else 0,
+            "cizilen_kroki_toplam_uzunluk_m": (
+                round(raw_sketch_len_m, 1) if raw_sketch_len_m is not None else None
+            ),
+            "hesaplanan_rota_toplam_uzunluk_m": round(computed_route_len_m, 1),
+            "uretilen_direk_sayisi": len(data.virtual_nodes),
+            "A_baslangic": [round(data.start.lat, 6), round(data.start.lon, 6)],
+            "B_bitis": [round(data.end.lat, 6), round(data.end.lon, 6)],
+        })
+        if (
+            raw_sketch_len_m is not None
+            and computed_route_len_m < 0.5 * raw_sketch_len_m
+        ):
+            st.error(
+                "⚠️ Hesaplanan rota, çizdiğiniz krokinin uzunluğunun "
+                "yarısından kısa. Bu, direklerin krokinin büyük kısmı "
+                "boyunca değil sadece küçük bir parçasında üretildiği "
+                "anlamına gelir. Bu paneldeki bilgileri (özellikle "
+                "route_source ve uzunluk değerlerini) ekran görüntüsüyle "
+                "birlikte paylaşırsanız kesin sebebi bulabiliriz."
+            )
 
     mid_lat = (data.start.lat + data.end.lat) / 2
     mid_lon = (data.start.lon + data.end.lon) / 2
