@@ -124,12 +124,18 @@ class CorridorData:
         virtual_nodes: A'dan B'ye doğru üretilen sanal direk aday
             düğümleri listesi.
         route_source: Düğümlerin nasıl üretildiğini belirtir:
-            "road_snapped" -> yol ağı üzerinden rota bulundu ve direkler
-                yol kenarına offsetlendi (tercih edilen, gerçekçi durum).
+            "road_snapped" -> A/B noktaları arasında yol ağı üzerinden en
+                kısa rota bulundu ve direkler yol kenarına offsetlendi.
+            "sketch_matched" -> kullanıcının haritada kalemle çizdiği
+                (eğik/yamuk olabilen) kroki hattı, gerçek OSM yol ağına
+                harita-eşleştirme (map-matching) ile oturtuldu ve
+                direkler bu eşleştirilmiş rotanın kenarına offsetlendi
+                (tercih edilen, en gerçekçi durum).
             "straight_line_fallback" -> yol ağı bulunamadı/rota
-                hesaplanamadı, A-B düz hattına geri dönüldü (bu durumda
-                sonuçlar binaların/engellerin üzerinden geçebilir ve
-                sadece kaba bir ön izleme olarak değerlendirilmelidir).
+                hesaplanamadı, A-B (ya da kroki uç noktaları) düz hattına
+                geri dönüldü (bu durumda sonuçlar binaların/engellerin
+                üzerinden geçebilir ve sadece kaba bir ön izleme olarak
+                değerlendirilmelidir).
     """
     start: GeoPoint
     end: GeoPoint
@@ -295,14 +301,25 @@ class CorridorDataCollector:
     # Public API
     # -------------------------------------------------------------- #
 
-    def run(self) -> CorridorData:
+    def run(self, sketch_points: Optional[List[GeoPoint]] = None) -> CorridorData:
         """Tüm veri toplama ve sanal düğüm üretim akışını çalıştırır.
+
+        Args:
+            sketch_points: Kullanıcının haritada kalemle serbest çizdiği
+                kroki hattının (WGS84) noktaları, A'dan B'ye sırayla.
+                Verilirse (en az 2 nokta), A-B arası salt en kısa yol
+                yerine, bu kroki gerçek OSM yol ağına harita-eşleştirme
+                (map-matching) ile oturtulur — böylece çizim eğik/yamuk
+                olsa bile kullanıcının "anlatmak istediği" güzergah
+                (örn. belirli bir sokaktan geçme niyeti) korunur.
+                None ise (varsayılan), eski davranış korunur: A ve B
+                arasında yol ağı üzerinden en kısa rota aranır.
 
         Returns:
             Bina, engel, yol katmanlarını, koridor poligonunu ve
             sanal düğüm listesini içeren CorridorData nesnesi.
         """
-        corridor_polygon_wgs84 = self._build_corridor_polygon()
+        corridor_polygon_wgs84 = self._build_corridor_polygon(sketch_points)
 
         buildings_gdf = self._fetch_osm_layer(
             corridor_polygon_wgs84, self.BUILDING_TAGS, layer_name="buildings"
@@ -314,8 +331,11 @@ class CorridorDataCollector:
             corridor_polygon_wgs84, self.ROAD_TAGS, layer_name="roads"
         )
 
-        # --- Rota hesaplama: önce yol ağı üzerinden dene, olmazsa düz hat ---
-        virtual_nodes, route_source = self._compute_virtual_nodes(corridor_polygon_wgs84)
+        # --- Rota hesaplama: kroki varsa eşleştir, yoksa en kısa yol,
+        # ikisi de olmazsa düz hat ---
+        virtual_nodes, route_source = self._compute_virtual_nodes(
+            corridor_polygon_wgs84, sketch_points
+        )
 
         corridor_data = CorridorData(
             start=self.start,
@@ -342,21 +362,37 @@ class CorridorDataCollector:
     # İç Yardımcı Metotlar (Private Helpers)
     # -------------------------------------------------------------- #
 
-    def _build_corridor_polygon(self) -> Polygon:
-        """A-B hattı etrafında `corridor_buffer_m` genişliğinde tampon
+    def _build_corridor_polygon(
+        self, sketch_points: Optional[List[GeoPoint]] = None
+    ) -> Polygon:
+        """Referans hat etrafında `corridor_buffer_m` genişliğinde tampon
         poligonu üretir. Bu poligon, OSM sorgularının sınırlarını
         (bounding region) belirler.
+
+        `sketch_points` verilmişse (kullanıcının kalemle çizdiği kroki),
+        referans hat A-B düz çizgisi DEĞİL, krokinin tüm noktalarından
+        geçen kırık çizgidir. Bu sayede OSM verisi (bina/engel/yol),
+        krokinin düz A-B hattından saptığı bölgeleri de kapsar; aksi
+        halde kullanıcı kavisli bir güzergah çizse bile koridor dışında
+        kalan sokaklar hiç çekilmemiş olurdu.
 
         İşlem hassasiyeti için UTM projeksiyonunda buffer uygulanır,
         ardından sonuç tekrar WGS84'e (EPSG:4326) dönüştürülür.
 
+        Args:
+            sketch_points: Varsa, kroki hattının WGS84 noktaları.
+
         Returns:
             WGS84 koordinat sisteminde koridor poligonu (Shapely Polygon).
         """
-        start_xy_utm = self.to_utm.transform(*self.start.as_xy())
-        end_xy_utm = self.to_utm.transform(*self.end.as_xy())
+        if sketch_points and len(sketch_points) >= 2:
+            coords_utm = [self.to_utm.transform(*p.as_xy()) for p in sketch_points]
+            line_utm = LineString(coords_utm)
+        else:
+            start_xy_utm = self.to_utm.transform(*self.start.as_xy())
+            end_xy_utm = self.to_utm.transform(*self.end.as_xy())
+            line_utm = LineString([start_xy_utm, end_xy_utm])
 
-        line_utm = LineString([start_xy_utm, end_xy_utm])
         buffered_utm = line_utm.buffer(self.corridor_buffer_m, cap_style=2)  # flat cap
 
         buffered_wgs84 = shapely_transform(
@@ -403,42 +439,197 @@ class CorridorDataCollector:
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
     def _compute_virtual_nodes(
-        self, corridor_polygon: Polygon
+        self,
+        corridor_polygon: Polygon,
+        sketch_points: Optional[List[GeoPoint]] = None,
     ) -> Tuple[List[VirtualNode], str]:
         """Sanal direk düğümlerini üretmenin ana orkestrasyon metodu.
 
-        Önce yol ağı üzerinden gerçek bir rota bulmayı dener (yollardan
-        geçen, köşelerde dönen, kaldırım kenarına offsetlenmiş direk
-        dizisi). Bu başarısız olursa (yol ağı bulunamadı, A/B bir yola
-        yakın değil, bağlantısız graf vb.) A-B düz hattına geri döner
-        ve bunu log'da açıkça belirtir.
+        `sketch_points` verilmişse önce kroki hattını gerçek yol ağına
+        eşleştirmeyi (map-matching) dener. Verilmemişse (ya da eşleştirme
+        başarısız olursa) A ve B arasında yol ağı üzerinden en kısa rotayı
+        bulmayı dener (yollardan geçen, köşelerde dönen, kaldırım kenarına
+        offsetlenmiş direk dizisi). Bu da başarısız olursa (yol ağı
+        bulunamadı, uç noktalar bir yola yakın değil, bağlantısız graf
+        vb.) düz hatta geri döner ve bunu log'da açıkça belirtir.
 
         Args:
             corridor_polygon: OSM yol ağının çekileceği alan (WGS84).
+            sketch_points: Varsa, kullanıcının kalemle çizdiği kroki
+                hattının WGS84 noktaları (A'dan B'ye sırayla).
 
         Returns:
             (virtual_nodes, route_source) tuple'ı. route_source,
-            "road_snapped" veya "straight_line_fallback" değerini alır.
+            "sketch_matched", "road_snapped" veya
+            "straight_line_fallback" değerlerinden birini alır.
         """
         road_graph = self._fetch_road_graph(corridor_polygon)
 
         if road_graph is not None:
-            route_line_utm = self._compute_road_route_utm(road_graph)
+            if sketch_points and len(sketch_points) >= 2:
+                route_line_utm = self._match_sketch_to_road_graph(
+                    road_graph, sketch_points
+                )
+                route_source = "sketch_matched"
+            else:
+                route_line_utm = self._compute_road_route_utm(road_graph)
+                route_source = "road_snapped"
+
             if route_line_utm is not None:
                 offset_line_utm = self._offset_route_line(route_line_utm)
                 nodes = self._generate_nodes_along_line(offset_line_utm)
-                return nodes, "road_snapped"
+                return nodes, route_source
 
         logger.warning(
-            "Yol ağı üzerinden geçerli bir rota bulunamadı; A-B düz hattına "
-            "geri dönülüyor. UYARI: Bu durumda direk noktaları bina/engel "
-            "üzerinden geçebilir, sonuç yalnızca kaba bir ön izlemedir."
+            "Geçerli bir rota (kroki eşleştirmesi ya da en kısa yol) "
+            "bulunamadı; düz hatta geri dönülüyor. UYARI: Bu durumda "
+            "direk noktaları bina/engel üzerinden geçebilir, sonuç "
+            "yalnızca kaba bir ön izlemedir."
         )
         start_xy = np.array(self.to_utm.transform(*self.start.as_xy()))
         end_xy = np.array(self.to_utm.transform(*self.end.as_xy()))
         straight_line_utm = LineString([tuple(start_xy), tuple(end_xy)])
         nodes = self._generate_nodes_along_line(straight_line_utm)
         return nodes, "straight_line_fallback"
+
+    def _resample_line_utm(
+        self, line_utm: LineString, interval_m: float
+    ) -> List[Tuple[float, float]]:
+        """UTM çizgisini eşit `interval_m` aralıklarla örnekleyip nokta
+        listesi üretir (çizginin kendi köşeleri örnekleme dışında da
+        işin doğası gereği aradaki noktalarla örtük olarak yakalanır).
+
+        Bu, kullanıcının serbest elle çizdiği (dolayısıyla köşe sayısı
+        ve şekli belirsiz/gürültülü olabilen) bir hattı, yol ağı ile
+        eşleştirme için yeterince sık "GPS iz noktası" gibi örneklenmiş
+        bir noktalar dizisine çevirmek için kullanılır.
+
+        Args:
+            line_utm: Örneklenecek UTM koordinatlı çizgi.
+            interval_m: Örnekler arası hedef mesafe (metre).
+
+        Returns:
+            (x, y) UTM koordinat tuple'larından oluşan liste.
+        """
+        length = line_utm.length
+        if length == 0:
+            return list(line_utm.coords)
+
+        distances = list(np.arange(0.0, length, interval_m))
+        if not distances or distances[-1] < length:
+            distances.append(length)
+
+        points = [line_utm.interpolate(d) for d in distances]
+        return [(p.x, p.y) for p in points]
+
+    def _match_sketch_to_road_graph(
+        self, road_graph: nx.MultiDiGraph, sketch_points: List[GeoPoint]
+    ) -> Optional[LineString]:
+        """Kullanıcının haritada kalemle serbest çizdiği (eğik/yamuk
+        olabilen) kroki hattını, gerçek OSM yol ağına "harita eşleştirme"
+        (map-matching) mantığıyla oturtur.
+
+        Yöntem: elle çizilen çizgi genelde düzensiz (fazla/eksik köşe,
+        titrek el hareketi vb.) olduğundan, önce çizgi eşit aralıklarla
+        yoğun biçimde örneklenir (`_resample_line_utm`). Her örnek nokta
+        yol ağının en yakın düğümüne "yapıştırılır" (snap); ardışık
+        aynı düğümler sadeleştirilir. Sonra bu düğüm dizisi bir dizi
+        "ara hedef" (waypoint) gibi ele alınır ve her ardışık waypoint
+        çifti arasında en kısa yol hesaplanıp uç uca eklenir.
+
+        Bu sayede, çizim tam olarak yol üzerinde olmasa (eğik/kaymış
+        olsa) bile, nihai rota kullanıcının "anlatmak istediği" gerçek
+        sokak dizisini takip eder — çünkü yoğun örnekleme, çizginin
+        genel şeklini/yönünü (hangi sokaktan geçildiğini) yol ağına
+        aktarmaya yeter.
+
+        Args:
+            road_graph: `_fetch_road_graph` ile elde edilen graf.
+            sketch_points: Kroki hattının WGS84 noktaları.
+
+        Returns:
+            Eşleştirilmiş rotayı temsil eden UTM koordinatlı LineString,
+            ya da eşleştirme hiçbir şekilde başarılamazsa None (bu
+            durumda çağıran taraf düz hatta geri döner).
+        """
+        if len(sketch_points) < 2:
+            return None
+
+        sketch_coords_utm = [self.to_utm.transform(*p.as_xy()) for p in sketch_points]
+        sketch_line_utm = LineString(sketch_coords_utm)
+
+        # Kullanıcının çizdiği köşeleri kaçırmamak için node_spacing_m'den
+        # bağımsız, sabitçe sık bir örnekleme aralığı kullanılır (10-25m).
+        match_interval = max(10.0, min(self.node_spacing_m, 25.0))
+        waypoints_utm = self._resample_line_utm(sketch_line_utm, match_interval)
+
+        waypoints_lonlat = [self.to_wgs84.transform(x, y) for x, y in waypoints_utm]
+        xs = [lon for lon, _lat in waypoints_lonlat]
+        ys = [lat for _lon, lat in waypoints_lonlat]
+
+        try:
+            nearest = ox.distance.nearest_nodes(road_graph, X=xs, Y=ys)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Kroki noktaları yol ağına yapıştırılamadı (snap): %s", exc)
+            return None
+
+        # Ardışık aynı düğümleri sadeleştir (yoğun örnekleme aynı yol
+        # segmentine düşen birçok noktayı aynı düğüme yapıştırabilir).
+        waypoint_nodes: List[int] = []
+        for node_id in nearest:
+            if not waypoint_nodes or waypoint_nodes[-1] != node_id:
+                waypoint_nodes.append(node_id)
+
+        if len(waypoint_nodes) < 2:
+            logger.warning(
+                "Kroki, yol ağında tek bir düğüme yapıştı; anlamlı bir "
+                "rota oluşturulamadı."
+            )
+            return None
+
+        full_route_nodes: List[int] = [waypoint_nodes[0]]
+        skipped_segments = 0
+
+        for i in range(len(waypoint_nodes) - 1):
+            origin, dest = waypoint_nodes[i], waypoint_nodes[i + 1]
+            try:
+                sub_path = nx.shortest_path(road_graph, origin, dest, weight="length")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                # Bu ara segment bağlantısız kalmış olabilir (örn. krokinin
+                # bir kısmı yol ağı dışına taştı); atla ve bir sonraki
+                # yakalanan noktadan devam et. Rotanın tamamını iptal
+                # etmiyoruz çünkü kullanıcının çizdiği hattın büyük kısmı
+                # hâlâ geçerli olabilir.
+                skipped_segments += 1
+                continue
+            # sub_path[0] zaten full_route_nodes'un son elemanına eşit
+            # (origin) olduğundan tekrar eklenmiyor.
+            full_route_nodes.extend(sub_path[1:])
+
+        if len(full_route_nodes) < 2:
+            logger.warning("Kroki hattı yol ağı üzerinde bir rotaya dönüştürülemedi.")
+            return None
+
+        if skipped_segments:
+            logger.warning(
+                "Kroki eşleştirmesinde %d ara segment bağlantısız yol ağı "
+                "nedeniyle atlandı; rota bir sonraki yakalanan noktadan "
+                "devam etti.",
+                skipped_segments,
+            )
+
+        coords_utm: List[Tuple[float, float]] = []
+        for node_id in full_route_nodes:
+            node_data = road_graph.nodes[node_id]
+            x, y = self.to_utm.transform(node_data["x"], node_data["y"])
+            coords_utm.append((x, y))
+
+        logger.info(
+            "Kroki -> yol ağı eşleştirmesi tamamlandı | %d kroki örnek "
+            "noktası -> %d benzersiz waypoint -> %d rota düğümü",
+            len(waypoints_utm), len(waypoint_nodes), len(coords_utm),
+        )
+        return LineString(coords_utm)
 
     def _fetch_road_graph(self, corridor_polygon: Polygon) -> Optional[nx.MultiDiGraph]:
         """Koridor poligonu içindeki OSM yol ağını, rota hesaplamaya
