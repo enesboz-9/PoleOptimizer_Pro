@@ -353,9 +353,16 @@ class CorridorDataCollector:
                 return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
             return gdf
         except Exception as exc:  # noqa: BLE001
-            # OSM/Overpass tarafında zaman aşımı veya boş sonuç normal bir
-            # senaryodur; pipeline'ı durdurmak yerine boş katman ile devam et.
-            logger.error("'%s' katmanı çekilirken hata oluştu: %s", layer_name, exc)
+            # OSM/Overpass tarafında "veri bulunamadı" (örn. seçilen koridorda
+            # hiç bina/su/sit alanı olmaması) normal bir senaryodur ve HATA
+            # DEĞİLDİR; pipeline'ı durdurmak yerine boş katman ile devam
+            # edilir. Overpass kütüphanesi bu durumu bir exception olarak
+            # fırlattığı için burada yakalanıp bilgi (INFO) seviyesinde
+            # loglanıyor.
+            logger.info(
+                "'%s' katmanı için OSM'de veri bulunamadı (bu normal olabilir): %s",
+                layer_name, exc,
+            )
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
     def _generate_virtual_nodes(self) -> List[VirtualNode]:
