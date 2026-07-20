@@ -793,12 +793,14 @@ else:
     )
 
     show_span_distances = st.checkbox(
-        "📏 Direkler arası mesafeyi haritada göster",
+        "📏 Direkler arası mesafeyi haritada etiket olarak göster",
         value=False,
         help=(
-            "İşaretlenirse, ardışık her iki direk arasına o segmentin "
-            "uzunluğunu (metre) gösteren bir etiket eklenir. Her direğin "
-            "popup'ında da bir önceki direğe olan mesafe zaten yer alır."
+            "Direkler arası kablo geçişi (kesikli yeşil çizgi) haritada "
+            "HER ZAMAN gösterilir. Bu kutu yalnızca, işaretlenirse her "
+            "segmentin üzerine uzunluğunu (metre) yazan ek bir etiket "
+            "ekler. Her direğin popup'ında da bir önceki direğe olan "
+            "mesafe zaten yer alır."
         ),
     )
     show_corridor_polygon = st.checkbox(
@@ -930,20 +932,28 @@ else:
             popup=folium.Popup(popup_html, max_width=250),
         ).add_to(fmap)
 
-        # İsteğe bağlı: bu direkle bir önceki direk arasındaki mesafeyi
-        # segment üzerinde bir etiket olarak göster.
-        if show_span_distances and prev_node is not None:
-            mid_seg_lat = (prev_node.point.lat + node.point.lat) / 2
-            mid_seg_lon = (prev_node.point.lon + node.point.lon) / 2
+        # Direkler arası kablo geçişini (fiziksel hat güzergahını) her
+        # zaman kesikli bir çizgiyle gösteriyoruz — bu, "Direkler arası
+        # mesafeyi göster" seçeneğinden bağımsızdır; o seçenek yalnızca
+        # segment üzerindeki metre etiketini açıp kapatır.
+        if prev_node is not None:
             folium.PolyLine(
                 [
                     (prev_node.point.lat, prev_node.point.lon),
                     (node.point.lat, node.point.lon),
                 ],
                 color="#2ca02c",
-                weight=2,
-                opacity=0.7,
+                weight=3,
+                opacity=0.85,
+                dash_array="10,6",
+                tooltip=f"Kablo geçişi: {node.span_length_m:.0f} m",
             ).add_to(fmap)
+
+        # İsteğe bağlı: bu direkle bir önceki direk arasındaki mesafeyi
+        # segment üzerinde bir etiket olarak da göster.
+        if show_span_distances and prev_node is not None:
+            mid_seg_lat = (prev_node.point.lat + node.point.lat) / 2
+            mid_seg_lon = (prev_node.point.lon + node.point.lon) / 2
             folium.Marker(
                 [mid_seg_lat, mid_seg_lon],
                 icon=folium.DivIcon(
