@@ -865,6 +865,17 @@ class CorridorDataCollector:
     # yüzlerce metre uzağa "ışınlanabilir".
     MAX_ROAD_SNAP_DISTANCE_M = 25.0
 
+    # Art arda iki düğüm yola bağımsız olarak yapıştırıldığında, aralarındaki
+    # gerçek mesafenin rotadaki beklenen açıklığa (`span_length_m`) oranı bu
+    # aralığın dışına çıkarsa, yapıştırma "tutarsız" kabul edilir (bkz.
+    # `_place_poles_along_route` adım 4) — çünkü bu, iki düğümün aynı yol
+    # noktasına yakınsayıp kümelendiğini (çok küçük oran) ya da rotanın
+    # izlediği basitleştirilmiş hattın gerçek yoldan önemli ölçüde farklı
+    # kıvrıldığını (çok büyük oran) gösterir; her iki durumda da direk
+    # dizilimi düzensiz/aralıklı görünür.
+    SNAP_CONSISTENCY_RATIO_MIN = 0.3
+    SNAP_CONSISTENCY_RATIO_MAX = 3.0
+
     def _prepare_road_lines_utm(
         self, roads_gdf: gpd.GeoDataFrame
     ) -> List[LineString]:
@@ -1045,6 +1056,19 @@ class CorridorDataCollector:
              bulunamazsa, o nokta rotanın kendi yerel dikeyine göre sabit
              offsetlenir (güvenli fallback) — direk asla çizilen hattan
              anlamsız derecede uzağa sıçramaz.
+          4. Her düğüm BAĞIMSIZ olarak en yakın yola yapıştırıldığı için,
+             gerçek yol rotanın izlediği hayali çizgiden (basitleştirilmiş
+             graf kirişinden) farklı bükülüyorsa, art arda iki düğüm
+             yola izdüşürüldüğünde birbirine anormal derecede yakınlaşıp
+             ("kümelenme") ya da anormal derecede uzaklaşabilir
+             ("boşluk/eksik nokta görüntüsü") — çünkü en yakın nokta
+             projeksiyonu, orijinal rota üzerindeki düzenli aralığı
+             (arc-length) yol üzerinde otomatik olarak korumaz. Bunu
+             önlemek için, art arda iki yapıştırılmış nokta arasındaki
+             gerçek mesafe, rotadaki beklenen açıklıktan
+             (`span_length_m`) çok sapıyorsa (bkz.
+             `SNAP_CONSISTENCY_RATIO_MIN/MAX`), o düğümün yol yapıştırması
+             güvenilmez sayılıp adım 3'teki güvenli fallback'e dönülür.
 
         Args:
             route_line_utm: Orijinal (offsetlenmemiş) rota, UTM
@@ -1054,8 +1078,8 @@ class CorridorDataCollector:
 
         Returns:
             node_id sırasına göre sıralı, her biri en yakın yol kenarına
-            yapıştırılmış (ya da yakında yol yoksa güvenli fallback ile
-            offsetlenmiş) VirtualNode listesi.
+            yapıştırılmış (ya da yakında yol yoksa/yapıştırma tutarsızsa
+            güvenli fallback ile offsetlenmiş) VirtualNode listesi.
         """
         raw_nodes = self._generate_nodes_along_line(route_line_utm)
 
@@ -1070,7 +1094,9 @@ class CorridorDataCollector:
         signed_side = 1.0 if self.offset_side == "left" else -1.0
 
         snapped_count = 0
+        rejected_count = 0
         placed_nodes: List[VirtualNode] = []
+        prev_placed_point: Optional[Point] = None
 
         for node in raw_nodes:
             x, y = self.to_utm.transform(node.point.lon, node.point.lat)
@@ -1078,12 +1104,33 @@ class CorridorDataCollector:
 
             tangent = self._route_tangent_at(route_line_utm, point_utm)
             route_perp = (-tangent[1] * signed_side, tangent[0] * signed_side)
+            fallback_point = Point(
+                point_utm.x + route_perp[0] * self.pole_offset_m,
+                point_utm.y + route_perp[1] * self.pole_offset_m,
+            )
 
             new_point, did_snap = self._snap_point_to_road_edge(
                 point_utm, road_lines, road_tree, route_perp
             )
+
+            if did_snap and prev_placed_point is not None and node.span_length_m > 1e-6:
+                actual_gap = new_point.distance(prev_placed_point)
+                gap_ratio = actual_gap / node.span_length_m
+                if (
+                    gap_ratio < self.SNAP_CONSISTENCY_RATIO_MIN
+                    or gap_ratio > self.SNAP_CONSISTENCY_RATIO_MAX
+                ):
+                    # Bu düğümün yol yapıştırması, rotadaki beklenen
+                    # açıklıkla tutarsız (kümelenme ya da anormal
+                    # sıçrama) — güvenilmez kabul edilip rota-dikeyine
+                    # sabit offsetlenmiş güvenli noktaya dönülüyor.
+                    new_point = fallback_point
+                    did_snap = False
+                    rejected_count += 1
+
             if did_snap:
                 snapped_count += 1
+            prev_placed_point = new_point
 
             lon, lat = self.to_wgs84.transform(new_point.x, new_point.y)
             placed_nodes.append(
@@ -1094,13 +1141,14 @@ class CorridorDataCollector:
                     span_length_m=node.span_length_m,
                     is_corner=node.is_corner,
                 )
+
             )
 
         logger.info(
             "Yol kenarına yapıştırma tamamlandı | %d/%d düğüm gerçek yol "
-            "kenarına yapıştırıldı (kalanlar, yakında yol bulunamadığı "
-            "için rota-dikeyine sabit offsetlendi).",
-            snapped_count, len(placed_nodes),
+            "kenarına yapıştırıldı | %d düğüm tutarsız yapıştırma (kümelenme/"
+            "sıçrama) tespit edilip güvenli fallback'e döndürüldü.",
+            snapped_count, len(placed_nodes), rejected_count,
         )
 
         return placed_nodes
