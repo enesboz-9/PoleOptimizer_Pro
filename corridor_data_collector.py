@@ -556,7 +556,22 @@ class CorridorDataCollector:
             return None
 
         sketch_coords_utm = [self.to_utm.transform(*p.as_xy()) for p in sketch_points]
-        sketch_line_utm = LineString(sketch_coords_utm)
+
+        # Çizim aracı, son noktayı bitirmek için çift tıklama gerektirir;
+        # bu genelde aynı (ya da bir-iki piksel kaymış) koordinatta fazladan
+        # bir vertex bırakır. Böyle bitişik/tekrarlı ardışık noktaları
+        # (< 0.5m) sadeleştiriyoruz, aksi halde sıfır uzunluklu son
+        # segment örneklemeyi ve eşleştirmeyi bozabilir.
+        deduped_coords_utm: List[Tuple[float, float]] = [sketch_coords_utm[0]]
+        for x, y in sketch_coords_utm[1:]:
+            last_x, last_y = deduped_coords_utm[-1]
+            if math.hypot(x - last_x, y - last_y) >= 0.5:
+                deduped_coords_utm.append((x, y))
+        if len(deduped_coords_utm) < 2:
+            logger.warning("Kroki noktaları birbirine çok yakın; anlamlı bir çizgi oluşmadı.")
+            return None
+
+        sketch_line_utm = LineString(deduped_coords_utm)
 
         # Kullanıcının çizdiği köşeleri kaçırmamak için node_spacing_m'den
         # bağımsız, sabitçe sık bir örnekleme aralığı kullanılır (10-25m).
@@ -587,13 +602,21 @@ class CorridorDataCollector:
             )
             return None
 
+        # Rota, yönsüz (undirected) bir graf üzerinde hesaplanır: tek
+        # yönlü sokaklar directed kenar olarak modellendiği için, kroki
+        # bir noktada tek yönlü akışın tersine gitmeyi gerektirirse
+        # (örn. bir sokakta gidip aynı/paralel sokaktan geri gelen bir
+        # çizim) yönlü grafikte rota bulunamaz. Direk yerleşimi için
+        # araç yönü zaten anlamsızdır.
+        route_graph = road_graph.to_undirected()
+
         full_route_nodes: List[int] = [waypoint_nodes[0]]
         skipped_segments = 0
 
         for i in range(len(waypoint_nodes) - 1):
             origin, dest = waypoint_nodes[i], waypoint_nodes[i + 1]
             try:
-                sub_path = nx.shortest_path(road_graph, origin, dest, weight="length")
+                sub_path = nx.shortest_path(route_graph, origin, dest, weight="length")
             except (nx.NetworkXNoPath, nx.NodeNotFound):
                 # Bu ara segment bağlantısız kalmış olabilir (örn. krokinin
                 # bir kısmı yol ağı dışına taştı); atla ve bir sonraki
@@ -668,6 +691,14 @@ class CorridorDataCollector:
         """A ve B'yi yol ağının en yakın düğümlerine "yapıştırıp" (snap)
         aralarındaki en kısa mesafeli rotayı hesaplar.
 
+        Not: Rota, yönsüz (undirected) bir graf üzerinde hesaplanır.
+        OSM sürüş (drive) grafiği yönlüdür (tek yönlü sokaklar directed
+        kenar olarak modellenir); ama direk yerleşimi için yön önemsizdir
+        — bir direk, tek yönlü bir sokakta hangi yönde "araç akışı" olursa
+        olsun aynı fiziksel yerde durur. Yönlü grafik kullanılsaydı, A-B
+        arası rota tek yönlü bir sokağın tersine gitmeyi gerektirdiğinde
+        (örn. bir döngü/geri dönüş şekli) rota bulunamayabilirdi.
+
         Args:
             road_graph: `_fetch_road_graph` ile elde edilen graf.
 
@@ -686,9 +717,11 @@ class CorridorDataCollector:
             logger.warning("A/B noktaları yol ağına yapıştırılamadı (snap): %s", exc)
             return None
 
+        route_graph = road_graph.to_undirected()
+
         try:
             route_node_ids = nx.shortest_path(
-                road_graph, orig_node, dest_node, weight="length"
+                route_graph, orig_node, dest_node, weight="length"
             )
         except (nx.NetworkXNoPath, nx.NodeNotFound) as exc:
             logger.warning(
