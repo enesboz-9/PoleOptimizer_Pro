@@ -847,32 +847,55 @@ class CorridorDataCollector:
         )
         return LineString(coords_utm)
 
+    # Offset sonucu, orijinal rotanın bu oranından daha kısa çıkarsa
+    # (örn. keskin köşeli/döngüsel bir kroki üzerinde offset_curve'ün
+    # kendi kendine kesişip küçük bir parçaya "çökmesi" durumunda),
+    # offset güvenilmez sayılır ve offsetsiz orijinal hatta geri dönülür.
+    # Bu olmadan, tüm krokinin (örn. büyük bir mahalle turu gibi
+    # döngüsel bir hat) yalnızca başlangıca yakın minik bir parçaya
+    # indirgenip geri kalan tüm düğümlerin sessizce kaybolması mümkündü.
+    MIN_OFFSET_LENGTH_RATIO = 0.6
+
     def _offset_route_line(self, route_line_utm: LineString) -> LineString:
         """Rota çizgisini, direklerin yolun ORTASINDA değil KENARINDA
         durması için `pole_offset_m` kadar yana kaydırır (offset).
 
-        Kavşak/köşe noktalarında keskin offset artefaktları oluşmaması
-        için mitre (gönye) birleşim stili kullanılır; bu, orijinal
-        rotanın köşe noktalarını byüyük ölçüde korur.
+        "round" (yuvarlak) birleşim stili kullanılır: "mitre" (gönye)
+        stili köşeleri geometrik olarak daha keskin korusa da, elle
+        çizilmiş (freehand) krokilerde sık rastlanan keskin/dar açılarda
+        çok uzun "iğne" (spike) uçları üretip GEOS'un offset sonucunu
+        kendi kendine kesişen, parçalanmış bir MultiLineString'e
+        dönüştürmesine yol açabiliyordu — bu da en uzun parçanın bile
+        orijinal hattın çok küçük bir kesiti olmasına (dolayısıyla
+        çizilen hattın büyük kısmının "kaybolmasına") sebep olabiliyordu.
+        "round" stili böyle spike'lar üretmediği için çok daha kararlıdır;
+        bedeli, köşelerin gönye yerine hafifçe yuvarlak olmasıdır ki bu
+        direk yerleşimi hassasiyeti için ihmal edilebilir.
+
+        Buna ek olarak, offset sonucu yine de orijinal hattan anormal
+        derecede kısa çıkarsa (`MIN_OFFSET_LENGTH_RATIO` altına düşerse),
+        sonuç güvenilmez kabul edilip offsetsiz orijinal hatta dönülür.
 
         Args:
             route_line_utm: Yol ağından elde edilen orijinal (orta hat)
                 rota, UTM koordinatlarında.
 
         Returns:
-            Offsetlenmiş LineString. Offset başarısız olursa (örn.
-            çok kısa/dejenere geometri), güvenli fallback olarak
-            offsetsiz orijinal rota döner.
+            Offsetlenmiş LineString. Offset başarısız ya da anormal
+            derecede kısa çıkarsa, güvenli fallback olarak offsetsiz
+            orijinal rota döner.
         """
         if self.pole_offset_m == 0:
             return route_line_utm
+
+        original_length = route_line_utm.length
 
         # Shapely offset_curve sözleşmesi: pozitif mesafe, çizginin
         # A->B yönüne göre SOLUNA offsetler; negatif mesafe SAĞINA.
         signed_offset = self.pole_offset_m if self.offset_side == "left" else -self.pole_offset_m
 
         try:
-            offset_geom = route_line_utm.offset_curve(signed_offset, join_style="mitre")
+            offset_geom = route_line_utm.offset_curve(signed_offset, join_style="round")
             if offset_geom.is_empty:
                 raise ValueError("Offset sonucu boş geometri döndü.")
             if isinstance(offset_geom, MultiLineString):
@@ -880,6 +903,19 @@ class CorridorDataCollector:
                 # fazla parçaya bölünebilir; en uzun parçayı ana rota
                 # olarak kabul ediyoruz.
                 offset_geom = max(offset_geom.geoms, key=lambda g: g.length)
+
+            if (
+                original_length > 0
+                and offset_geom.length < self.MIN_OFFSET_LENGTH_RATIO * original_length
+            ):
+                logger.warning(
+                    "Offset sonucu orijinal rotadan çok daha kısa çıktı "
+                    "(%.1fm -> %.1fm); offset güvenilmez kabul edilip "
+                    "offsetsiz orijinal hatta geri dönülüyor.",
+                    original_length, offset_geom.length,
+                )
+                return route_line_utm
+
             return offset_geom
         except Exception as exc:  # noqa: BLE001
             logger.warning(
