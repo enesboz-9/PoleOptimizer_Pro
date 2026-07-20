@@ -438,9 +438,19 @@ with st.sidebar:
         help="Direklerin yol orta hattından kaldırım kenarına doğru ne kadar kaydırılacağı.",
     )
     offset_side = st.radio(
-        "Offset yönü (A→B'ye bakarken)", options=["right", "left"],
-        format_func=lambda v: "Sağ" if v == "right" else "Sol",
+        "Offset yönü", options=["auto", "right", "left"],
+        format_func=lambda v: {
+            "auto": "🧭 Otomatik (çizdiğim tarafa göre)",
+            "right": "Sağ (A→B'ye bakarken)",
+            "left": "Sol (A→B'ye bakarken)",
+        }[v],
         horizontal=True,
+        help=(
+            "Otomatik: direkler, sizin haritada ÇİZDİĞİNİZ krokinin yolun "
+            "hangi tarafında olduğunu tespit edip o tarafa yerleştirilir "
+            "(yalnızca ✏️ kroki modunda anlamlıdır). Elle koordinat "
+            "modunda ya da kroki yoksa 'Sağ' varsayılanına düşülür."
+        ),
     )
 
 # ------------------------------------------------------------------ #
@@ -695,6 +705,17 @@ else:
             "popup'ında da bir önceki direğe olan mesafe zaten yer alır."
         ),
     )
+    show_corridor_polygon = st.checkbox(
+        "🟧 Koridor tampon alanını (OSM veri sınırını) haritada göster",
+        value=False,
+        help=(
+            "İşaretlenirse, OSM verisinin çekildiği tampon poligonunun "
+            "sınırı turuncu bir çizgiyle gösterilir. Varsayılan olarak "
+            "kapalıdır — bu sınır direklerin ya da hattın kendisi DEĞİLDİR, "
+            "sadece hangi alanda bina/yol verisi arandığını gösterir ve "
+            "haritayı karmaşıklaştırabilir."
+        ),
+    )
 
     with st.expander("🔧 Teşhis Bilgisi (sorun bildirirken bu bölümü paylaşın)"):
         raw_sketch_len_m = None
@@ -842,7 +863,7 @@ else:
 
         prev_node = node
 
-    if data.corridor_polygon is not None:
+    if show_corridor_polygon and data.corridor_polygon is not None:
         folium.GeoJson(
             data.corridor_polygon.__geo_interface__,
             style_function=lambda _: {"color": "#ff7f0e", "fillOpacity": 0.05},
