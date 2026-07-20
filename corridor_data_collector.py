@@ -32,13 +32,15 @@ import numpy as np
 try:
     import osmnx as ox
     import geopandas as gpd
-    from shapely.geometry import Point, LineString, Polygon
+    import networkx as nx
+    from shapely.geometry import Point, LineString, Polygon, MultiLineString
     from shapely.ops import transform as shapely_transform
     import pyproj
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
-        "Bu modül osmnx, geopandas, shapely ve pyproj paketlerine ihtiyaç duyar. "
-        "Kurulum için: pip install osmnx geopandas shapely pyproj"
+        "Bu modül osmnx, geopandas, networkx, shapely ve pyproj paketlerine "
+        "ihtiyaç duyar. Kurulum için: pip install osmnx geopandas networkx "
+        "shapely pyproj"
     ) from exc
 
 logging.basicConfig(level=logging.INFO)
@@ -88,6 +90,12 @@ class VirtualNode:
             sonraki modülde doldurulur).
         blocking_reason: Eğer is_feasible=False ise, sebebi (örn.
             "slope_exceeds_25pct", "inside_building_polygon" vb.).
+        is_corner: True ise, bu düğüm rotanın bir dönüş/kavşak noktasında
+            (yol ağının bir vertex'inde) bulunuyor demektir. Kavşak
+            direkleri genellikle açısal çekme kuvvetine maruz kaldığından
+            (guy-wire / gerilme direği) mühendislik açısından düz hat
+            üzerindeki ara direklerden farklı muamele görür; bu yüzden
+            zorunlu (atlanamaz) düğüm olarak işaretlenir.
     """
     node_id: int
     point: GeoPoint
@@ -95,6 +103,7 @@ class VirtualNode:
     is_feasible: Optional[bool] = None
     elevation_m: Optional[float] = None
     blocking_reason: Optional[str] = None
+    is_corner: bool = False
 
 
 @dataclass
@@ -112,8 +121,15 @@ class CorridorData:
         roads_gdf: OSM'den çekilen yol/karayolu çizgileri (GeoDataFrame).
         corridor_polygon: A-B hattı etrafında oluşturulan tampon
             poligonu (WGS84, EPSG:4326).
-        virtual_nodes: A'dan B'ye doğru X metre aralıklarla üretilen
-            sanal direk aday düğümleri listesi.
+        virtual_nodes: A'dan B'ye doğru üretilen sanal direk aday
+            düğümleri listesi.
+        route_source: Düğümlerin nasıl üretildiğini belirtir:
+            "road_snapped" -> yol ağı üzerinden rota bulundu ve direkler
+                yol kenarına offsetlendi (tercih edilen, gerçekçi durum).
+            "straight_line_fallback" -> yol ağı bulunamadı/rota
+                hesaplanamadı, A-B düz hattına geri dönüldü (bu durumda
+                sonuçlar binaların/engellerin üzerinden geçebilir ve
+                sadece kaba bir ön izleme olarak değerlendirilmelidir).
     """
     start: GeoPoint
     end: GeoPoint
@@ -123,6 +139,7 @@ class CorridorData:
     roads_gdf: gpd.GeoDataFrame = field(default_factory=gpd.GeoDataFrame)
     corridor_polygon: Optional[Polygon] = None
     virtual_nodes: List[VirtualNode] = field(default_factory=list)
+    route_source: str = "straight_line_fallback"
 
 
 # ------------------------------------------------------------------ #
@@ -232,16 +249,34 @@ class CorridorDataCollector:
         end: GeoPoint,
         corridor_buffer_m: float = 150.0,
         node_spacing_m: float = 30.0,
+        pole_offset_m: float = 5.0,
+        offset_side: str = "right",
     ) -> None:
         if corridor_buffer_m <= 0:
             raise ValueError("corridor_buffer_m sıfırdan büyük olmalıdır.")
         if node_spacing_m <= 0:
             raise ValueError("node_spacing_m sıfırdan büyük olmalıdır.")
+        if pole_offset_m < 0:
+            raise ValueError("pole_offset_m negatif olamaz.")
+        if offset_side not in ("left", "right"):
+            raise ValueError("offset_side yalnızca 'left' veya 'right' olabilir.")
 
         self.start = start
         self.end = end
         self.corridor_buffer_m = corridor_buffer_m
         self.node_spacing_m = node_spacing_m
+        # pole_offset_m: Direklerin yol ORTA HATTINDAN ne kadar uzağa,
+        # kaldırım/yol kenarına doğru kaydırılacağı (metre). 0 verilirse
+        # direkler yolun tam ortasında kalır (gerçekçi değildir, trafiği
+        # keser); tipik olarak 3-6m arası bir değer kaldırım kenarına
+        # karşılık gelir. Kesin değer, gerçek kaldırım genişliği bilinene
+        # kadar bir yaklaşıklıktır.
+        self.pole_offset_m = pole_offset_m
+        # offset_side: Yürüyüş yönüne (A'dan B'ye) göre hangi tarafa
+        # offsetleneceği. Gerçek projede bu, YEDAŞ'ın mülkiyet/irtifak
+        # hakkı bulunan taraf gibi saha bilgisine göre seçilmelidir;
+        # şu an için sabit bir varsayılan sunuyoruz.
+        self.offset_side = offset_side
 
         # A-B hattının orta noktasına göre en uygun UTM projeksiyonunu seç.
         mid_lat = (start.lat + end.lat) / 2
@@ -251,9 +286,9 @@ class CorridorDataCollector:
 
         logger.info(
             "CorridorDataCollector başlatıldı | A=%s B=%s | UTM=%s | "
-            "buffer=%.1fm | spacing=%.1fm",
+            "buffer=%.1fm | spacing=%.1fm | pole_offset=%.1fm (%s)",
             start.as_tuple(), end.as_tuple(), self.utm_epsg,
-            corridor_buffer_m, node_spacing_m,
+            corridor_buffer_m, node_spacing_m, pole_offset_m, offset_side,
         )
 
     # -------------------------------------------------------------- #
@@ -279,7 +314,8 @@ class CorridorDataCollector:
             corridor_polygon_wgs84, self.ROAD_TAGS, layer_name="roads"
         )
 
-        virtual_nodes = self._generate_virtual_nodes()
+        # --- Rota hesaplama: önce yol ağı üzerinden dene, olmazsa düz hat ---
+        virtual_nodes, route_source = self._compute_virtual_nodes(corridor_polygon_wgs84)
 
         corridor_data = CorridorData(
             start=self.start,
@@ -290,13 +326,14 @@ class CorridorDataCollector:
             roads_gdf=roads_gdf,
             corridor_polygon=corridor_polygon_wgs84,
             virtual_nodes=virtual_nodes,
+            route_source=route_source,
         )
 
         logger.info(
             "Veri toplama tamamlandı | %d bina | %d engel poligonu | "
-            "%d yol segmenti | %d sanal düğüm",
+            "%d yol segmenti | %d sanal düğüm | rota kaynağı=%s",
             len(buildings_gdf), len(obstacles_gdf), len(roads_gdf),
-            len(virtual_nodes),
+            len(virtual_nodes), route_source,
         )
 
         return corridor_data
@@ -365,54 +402,243 @@ class CorridorDataCollector:
             )
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
-    def _generate_virtual_nodes(self) -> List[VirtualNode]:
-        """A noktasından B noktasına doğru, `node_spacing_m` aralıklarla
-        sanal direk aday düğümleri (virtual nodes) üretir.
+    def _compute_virtual_nodes(
+        self, corridor_polygon: Polygon
+    ) -> Tuple[List[VirtualNode], str]:
+        """Sanal direk düğümlerini üretmenin ana orkestrasyon metodu.
 
-        Enterpolasyon, hassasiyet için UTM projeksiyonunda yapılır
-        (WGS84 derece biriminde doğrusal enterpolasyon coğrafi olarak
-        hatalı sonuç verir), ardından düğümler tekrar WGS84'e çevrilir.
+        Önce yol ağı üzerinden gerçek bir rota bulmayı dener (yollardan
+        geçen, köşelerde dönen, kaldırım kenarına offsetlenmiş direk
+        dizisi). Bu başarısız olursa (yol ağı bulunamadı, A/B bir yola
+        yakın değil, bağlantısız graf vb.) A-B düz hattına geri döner
+        ve bunu log'da açıkça belirtir.
 
-        Not: Bu fonksiyon SADECE A-B doğrusu üzerinde ham (kısıtsız)
-        aday noktalar üretir. Gerçek rota optimizasyonu (yamaçtan
-        kaçınma, bina etrafından dolanma vb.) sonraki "Optimizasyon
-        Motoru" modülünde bu düğümler bir başlangıç arama uzayı
-        (search space) olarak kullanılarak yapılır.
+        Args:
+            corridor_polygon: OSM yol ağının çekileceği alan (WGS84).
 
         Returns:
-            node_id sırasına göre (0 = A, son eleman = B) sıralanmış
-            VirtualNode listesi.
+            (virtual_nodes, route_source) tuple'ı. route_source,
+            "road_snapped" veya "straight_line_fallback" değerini alır.
         """
+        road_graph = self._fetch_road_graph(corridor_polygon)
+
+        if road_graph is not None:
+            route_line_utm = self._compute_road_route_utm(road_graph)
+            if route_line_utm is not None:
+                offset_line_utm = self._offset_route_line(route_line_utm)
+                nodes = self._generate_nodes_along_line(offset_line_utm)
+                return nodes, "road_snapped"
+
+        logger.warning(
+            "Yol ağı üzerinden geçerli bir rota bulunamadı; A-B düz hattına "
+            "geri dönülüyor. UYARI: Bu durumda direk noktaları bina/engel "
+            "üzerinden geçebilir, sonuç yalnızca kaba bir ön izlemedir."
+        )
         start_xy = np.array(self.to_utm.transform(*self.start.as_xy()))
         end_xy = np.array(self.to_utm.transform(*self.end.as_xy()))
+        straight_line_utm = LineString([tuple(start_xy), tuple(end_xy)])
+        nodes = self._generate_nodes_along_line(straight_line_utm)
+        return nodes, "straight_line_fallback"
 
-        total_distance_m = float(np.linalg.norm(end_xy - start_xy))
+    def _fetch_road_graph(self, corridor_polygon: Polygon) -> Optional[nx.MultiDiGraph]:
+        """Koridor poligonu içindeki OSM yol ağını, rota hesaplamaya
+        uygun bir networkx grafı (düğüm+kenar bağlantı bilgisiyle)
+        olarak çeker.
 
-        if total_distance_m == 0:
-            raise ValueError("Başlangıç ve bitiş noktaları aynı olamaz.")
+        Not: Bu, `_fetch_osm_layer` ile çekilen `roads_gdf`'den farklıdır
+        — `roads_gdf` sadece çizim/maskeleme amaçlı düz bir geometri
+        listesidir ve yol bağlantı topolojisini (hangi yol hangisine
+        bağlanıyor) içermez. Rota (en kısa yol) hesaplamak için gerçek
+        bir graf yapısı (`ox.graph_from_polygon`) gerekir.
 
-        num_segments = max(1, math.ceil(total_distance_m / self.node_spacing_m))
-        nodes: List[VirtualNode] = []
+        Args:
+            corridor_polygon: Yol ağının çekileceği alan (WGS84).
 
-        for i in range(num_segments + 1):
-            t = i / num_segments  # 0.0 -> A, 1.0 -> B
-            interpolated_xy = start_xy + t * (end_xy - start_xy)
-
-            lon, lat = self.to_wgs84.transform(interpolated_xy[0], interpolated_xy[1])
-            cumulative_distance = t * total_distance_m
-
-            nodes.append(
-                VirtualNode(
-                    node_id=i,
-                    point=GeoPoint(lat=lat, lon=lon),
-                    cumulative_distance_m=round(cumulative_distance, 3),
-                )
+        Returns:
+            networkx.MultiDiGraph, ya da veri/bağlantı hatası durumunda
+            None (bu durumda çağıran taraf düz hatta geri döner).
+        """
+        try:
+            graph = ox.graph_from_polygon(
+                corridor_polygon,
+                network_type="drive",
+                simplify=True,
+                retain_all=True,
             )
+            if graph.number_of_nodes() == 0:
+                logger.warning("Koridor içinde OSM yol ağı bulunamadı.")
+                return None
+            return graph
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Yol ağı (graph) çekilirken sorun oluştu: %s", exc)
+            return None
+
+    def _compute_road_route_utm(self, road_graph: nx.MultiDiGraph) -> Optional[LineString]:
+        """A ve B'yi yol ağının en yakın düğümlerine "yapıştırıp" (snap)
+        aralarındaki en kısa mesafeli rotayı hesaplar.
+
+        Args:
+            road_graph: `_fetch_road_graph` ile elde edilen graf.
+
+        Returns:
+            Rotayı temsil eden UTM koordinatlı LineString, ya da rota
+            bulunamazsa None.
+        """
+        try:
+            orig_node = ox.distance.nearest_nodes(
+                road_graph, X=self.start.lon, Y=self.start.lat
+            )
+            dest_node = ox.distance.nearest_nodes(
+                road_graph, X=self.end.lon, Y=self.end.lat
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("A/B noktaları yol ağına yapıştırılamadı (snap): %s", exc)
+            return None
+
+        try:
+            route_node_ids = nx.shortest_path(
+                road_graph, orig_node, dest_node, weight="length"
+            )
+        except (nx.NetworkXNoPath, nx.NodeNotFound) as exc:
+            logger.warning(
+                "A ve B arasında yol ağı üzerinden bir rota bulunamadı "
+                "(muhtemelen bağlantısız yol parçaları): %s", exc
+            )
+            return None
+
+        if len(route_node_ids) < 2:
+            return None
+
+        coords_utm: List[Tuple[float, float]] = []
+        for node_id in route_node_ids:
+            node_data = road_graph.nodes[node_id]
+            x, y = self.to_utm.transform(node_data["x"], node_data["y"])
+            coords_utm.append((x, y))
 
         logger.info(
-            "Toplam hat mesafesi: %.2f m | Üretilen düğüm sayısı: %d "
-            "(hedef aralık: %.1fm)",
-            total_distance_m, len(nodes), self.node_spacing_m,
+            "Yol ağı üzerinden rota bulundu | %d graf düğümü kullanıldı",
+            len(coords_utm),
+        )
+        return LineString(coords_utm)
+
+    def _offset_route_line(self, route_line_utm: LineString) -> LineString:
+        """Rota çizgisini, direklerin yolun ORTASINDA değil KENARINDA
+        durması için `pole_offset_m` kadar yana kaydırır (offset).
+
+        Kavşak/köşe noktalarında keskin offset artefaktları oluşmaması
+        için mitre (gönye) birleşim stili kullanılır; bu, orijinal
+        rotanın köşe noktalarını byüyük ölçüde korur.
+
+        Args:
+            route_line_utm: Yol ağından elde edilen orijinal (orta hat)
+                rota, UTM koordinatlarında.
+
+        Returns:
+            Offsetlenmiş LineString. Offset başarısız olursa (örn.
+            çok kısa/dejenere geometri), güvenli fallback olarak
+            offsetsiz orijinal rota döner.
+        """
+        if self.pole_offset_m == 0:
+            return route_line_utm
+
+        # Shapely offset_curve sözleşmesi: pozitif mesafe, çizginin
+        # A->B yönüne göre SOLUNA offsetler; negatif mesafe SAĞINA.
+        signed_offset = self.pole_offset_m if self.offset_side == "left" else -self.pole_offset_m
+
+        try:
+            offset_geom = route_line_utm.offset_curve(signed_offset, join_style="mitre")
+            if offset_geom.is_empty:
+                raise ValueError("Offset sonucu boş geometri döndü.")
+            if isinstance(offset_geom, MultiLineString):
+                # Karmaşık/kendisiyle kesişen rotalarda offset birden
+                # fazla parçaya bölünebilir; en uzun parçayı ana rota
+                # olarak kabul ediyoruz.
+                offset_geom = max(offset_geom.geoms, key=lambda g: g.length)
+            return offset_geom
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Rota offsetlenirken sorun oluştu, offsetsiz orta hat "
+                "kullanılacak: %s", exc
+            )
+            return route_line_utm
+
+    def _generate_nodes_along_line(self, line_utm: LineString) -> List[VirtualNode]:
+        """Verilen (offsetlenmiş) rota çizgisi üzerinde sanal direk
+        düğümleri üretir.
+
+        Stratejı: çizginin kendi vertex'leri (yol ağının köşe/dönüş
+        noktaları) HER ZAMAN birer düğüm olarak korunur ve `is_corner`
+        olarak işaretlenir — bunlar mühendislik açısından atlanamaz
+        (kavşak/açı direği gerektiren) noktalardır. İki vertex arasındaki
+        mesafe `node_spacing_m`'i aşıyorsa, aradaki boşluk maksimum
+        açıklık kısıtını ihlal etmeyecek şekilde eşit aralıklı ara
+        düğümlerle bölünür.
+
+        Args:
+            line_utm: UTM koordinatlarında rota çizgisi (offsetlenmiş
+                ya da düz hat fallback'i olabilir).
+
+        Returns:
+            node_id sırasına göre (0 = A ucu) sıralanmış VirtualNode
+            listesi.
+        """
+        coords = list(line_utm.coords)
+        if len(coords) < 2:
+            raise ValueError("Rota en az 2 noktadan oluşmalıdır.")
+
+        nodes: List[VirtualNode] = []
+        node_id = 0
+        cumulative_distance = 0.0
+
+        first_lon, first_lat = self.to_wgs84.transform(*coords[0])
+        nodes.append(
+            VirtualNode(
+                node_id=node_id,
+                point=GeoPoint(lat=first_lat, lon=first_lon),
+                cumulative_distance_m=0.0,
+                is_corner=True,
+            )
+        )
+        node_id += 1
+
+        for i in range(len(coords) - 1):
+            p1 = np.array(coords[i])
+            p2 = np.array(coords[i + 1])
+            segment_length = float(np.linalg.norm(p2 - p1))
+
+            if segment_length == 0:
+                continue
+
+            num_subsegments = max(1, math.ceil(segment_length / self.node_spacing_m))
+
+            for k in range(1, num_subsegments + 1):
+                t = k / num_subsegments
+                point_xy = p1 + t * (p2 - p1)
+                lon, lat = self.to_wgs84.transform(point_xy[0], point_xy[1])
+                cumulative_distance_at_point = cumulative_distance + t * segment_length
+
+                # Bir alt-segmentin son noktası (k == num_subsegments),
+                # orijinal rotanın gerçek bir vertex'ine (köşesine)
+                # denk gelir; bu yüzden köşe olarak işaretlenir.
+                is_corner_point = (k == num_subsegments)
+
+                nodes.append(
+                    VirtualNode(
+                        node_id=node_id,
+                        point=GeoPoint(lat=lat, lon=lon),
+                        cumulative_distance_m=round(cumulative_distance_at_point, 3),
+                        is_corner=is_corner_point,
+                    )
+                )
+                node_id += 1
+
+            cumulative_distance += segment_length
+
+        num_corners = sum(1 for n in nodes if n.is_corner)
+        logger.info(
+            "Toplam rota mesafesi: %.2f m | Üretilen düğüm sayısı: %d "
+            "(köşe/kavşak düğümü: %d) | hedef aralık: %.1fm",
+            cumulative_distance, len(nodes), num_corners, self.node_spacing_m,
         )
 
         return nodes
