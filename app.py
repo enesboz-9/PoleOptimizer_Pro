@@ -8,13 +8,22 @@ Bu dosya, projenin GERÇEK Streamlit uygulamasıdır ve deploy ayarlarında
 "main module" olarak BU dosya seçilmelidir (corridor_data_collector.py
 değil — o dosya saf bir backend modülüdür, arayüz içermez).
 
-Şu an sadece Modül 1'i (CorridorDataCollector) interaktif olarak test
-etmeye yarayan minimal bir arayüz sunuyor. Sonraki modüller (DEM/eğim
-kontrolü, optimizasyon motoru) eklendikçe bu dosya genişletilecek.
+Modül 1'i (CorridorDataCollector) interaktif olarak test etmeye yarayan
+arayüz iki giriş yöntemi sunar:
+    1) Elle koordinat gir  -> A ve B noktalarını sayısal olarak girip
+       en kısa yol ağı rotasını hesaplatma (eski davranış).
+    2) Haritada çiz (kalem) -> Kullanıcı haritada başlangıçtan bitişe
+       serbest elle (eğik/yamuk olabilen) bir kroki çizer; uygulama bu
+       krokiyi gerçek OSM yol ağına harita-eşleştirme (map-matching) ile
+       oturtur ve direkleri bu eşleştirilmiş rotanın kenarına yerleştirir.
+
+Her iki modda da, sonuç haritasındaki her direğe TIKLANDIĞINDA (hover
+değil, click) koordinatları bir popup içinde gösterilir.
 """
 
 import streamlit as st
 import folium
+from folium.plugins import Draw
 from streamlit_folium import st_folium
 
 from corridor_data_collector import CorridorDataCollector, GeoPoint
@@ -24,16 +33,32 @@ st.set_page_config(page_title="PoleOptimizer Pro", layout="wide")
 st.title("⚡ PoleOptimizer Pro")
 st.caption("Modül 1 Test Arayüzü: Koridor Veri Toplama & Sanal Düğüm Üretimi")
 
+# ------------------------------------------------------------------ #
+# Sidebar: ortak parametreler + giriş yöntemi seçimi
+# ------------------------------------------------------------------ #
 with st.sidebar:
     st.header("Girdi Parametreleri")
 
-    st.subheader("Başlangıç Noktası (A)")
-    start_lat = st.number_input("A - Enlem (lat)", value=40.5506, format="%.6f")
-    start_lon = st.number_input("A - Boylam (lon)", value=34.9556, format="%.6f")
+    st.subheader("Giriş Yöntemi")
+    input_mode = st.radio(
+        "Hat nasıl belirlenecek?",
+        options=["sketch", "manual"],
+        format_func=lambda v: "✏️ Haritada Çiz (Kalem)" if v == "sketch" else "🔢 Elle Koordinat Gir",
+    )
 
-    st.subheader("Bitiş Noktası (B)")
-    end_lat = st.number_input("B - Enlem (lat)", value=40.5650, format="%.6f")
-    end_lon = st.number_input("B - Boylam (lon)", value=34.9700, format="%.6f")
+    if input_mode == "manual":
+        st.subheader("Başlangıç Noktası (A)")
+        start_lat = st.number_input("A - Enlem (lat)", value=40.5506, format="%.6f")
+        start_lon = st.number_input("A - Boylam (lon)", value=34.9556, format="%.6f")
+
+        st.subheader("Bitiş Noktası (B)")
+        end_lat = st.number_input("B - Enlem (lat)", value=40.5650, format="%.6f")
+        end_lon = st.number_input("B - Boylam (lon)", value=34.9700, format="%.6f")
+    else:
+        st.subheader("Harita Merkezi (Çizim İçin)")
+        center_lat = st.number_input("Merkez - Enlem (lat)", value=40.5578, format="%.6f")
+        center_lon = st.number_input("Merkez - Boylam (lon)", value=34.9628, format="%.6f")
+        zoom_level = st.slider("Yakınlaştırma", 12, 19, 16)
 
     st.subheader("Koridor Ayarları")
     buffer_m = st.slider("Koridor genişliği (m)", 50, 500, 150, step=10)
@@ -50,20 +75,99 @@ with st.sidebar:
         horizontal=True,
     )
 
+# ------------------------------------------------------------------ #
+# Ana alan: giriş yöntemine göre çizim haritası ya da doğrudan buton
+# ------------------------------------------------------------------ #
+sketch_points = None
+
+if input_mode == "sketch":
+    st.subheader("✏️ Kroki: Hattı Kalemle Çizin")
+    st.caption(
+        "Haritanın sol üstündeki **çizgi (polyline)** aracına tıklayın, "
+        "başlangıç noktasından bitişe doğru sokakları kabaca takip ederek "
+        "tıklaya tıklaya ilerleyin, son noktada **çift tıklayarak** çizimi "
+        "bitirin. Çiziminiz eğik, yamuk ya da tam yol üzerinde olmasa bile "
+        "sorun değil — uygulama sizin anlatmak istediğiniz hattı en yakın "
+        "gerçek yol ağına oturtacak. Gerekirse kalem simgesinin yanındaki "
+        "düzenleme/silme araçlarıyla çizimi düzeltebilirsiniz."
+    )
+
+    draw_map = folium.Map(
+        location=[center_lat, center_lon], zoom_start=zoom_level, tiles="OpenStreetMap"
+    )
+    Draw(
+        export=False,
+        draw_options={
+            "polyline": {"shapeOptions": {"color": "#e91e63", "weight": 4}},
+            "polygon": False,
+            "rectangle": False,
+            "circle": False,
+            "marker": False,
+            "circlemarker": False,
+        },
+        edit_options={"edit": True, "remove": True},
+    ).add_to(draw_map)
+
+    draw_result = st_folium(
+        draw_map,
+        key="sketch_map",
+        width=None,
+        height=500,
+        returned_objects=["all_drawings"],
+    )
+
+    sketch_coords_lonlat = None
+    if draw_result:
+        drawings = draw_result.get("all_drawings") or []
+        line_drawings = [
+            d for d in drawings if d.get("geometry", {}).get("type") == "LineString"
+        ]
+        if line_drawings:
+            # Kullanıcı birden fazla çizgi çizmiş olabilir; en son çizileni kullan.
+            sketch_coords_lonlat = line_drawings[-1]["geometry"]["coordinates"]
+
+    if sketch_coords_lonlat and len(sketch_coords_lonlat) >= 2:
+        st.success(f"✅ Çizim algılandı: {len(sketch_coords_lonlat)} nokta. Hesaplamaya hazır.")
+        sketch_points = [GeoPoint(lat=lat, lon=lon) for lon, lat in sketch_coords_lonlat]
+    else:
+        st.info("Henüz bir çizgi çizilmedi. Haritadan bir hat çizin.")
+
+    run_button = st.button(
+        "🚀 Bu Çizimden Direkleri Hesapla",
+        type="primary",
+        disabled=sketch_points is None,
+    )
+else:
     run_button = st.button("🚀 Koridor Verisini Getir", type="primary")
 
+# ------------------------------------------------------------------ #
+# Hesaplama
+# ------------------------------------------------------------------ #
 if run_button:
     with st.spinner("OSM verisi çekiliyor ve sanal düğümler üretiliyor... (biraz sürebilir)"):
         try:
-            collector = CorridorDataCollector(
-                start=GeoPoint(lat=start_lat, lon=start_lon),
-                end=GeoPoint(lat=end_lat, lon=end_lon),
-                corridor_buffer_m=float(buffer_m),
-                node_spacing_m=float(spacing_m),
-                pole_offset_m=float(offset_m),
-                offset_side=offset_side,
-            )
-            data = collector.run()
+            if input_mode == "sketch":
+                start_pt = sketch_points[0]
+                end_pt = sketch_points[-1]
+                collector = CorridorDataCollector(
+                    start=start_pt,
+                    end=end_pt,
+                    corridor_buffer_m=float(buffer_m),
+                    node_spacing_m=float(spacing_m),
+                    pole_offset_m=float(offset_m),
+                    offset_side=offset_side,
+                )
+                data = collector.run(sketch_points=sketch_points)
+            else:
+                collector = CorridorDataCollector(
+                    start=GeoPoint(lat=start_lat, lon=start_lon),
+                    end=GeoPoint(lat=end_lat, lon=end_lon),
+                    corridor_buffer_m=float(buffer_m),
+                    node_spacing_m=float(spacing_m),
+                    pole_offset_m=float(offset_m),
+                    offset_side=offset_side,
+                )
+                data = collector.run()
             st.session_state["corridor_data"] = data
         except Exception as exc:  # noqa: BLE001
             st.error(f"Veri toplama sırasında bir hata oluştu: {exc}")
@@ -71,16 +175,25 @@ if run_button:
 
 data = st.session_state.get("corridor_data")
 
+# ------------------------------------------------------------------ #
+# Sonuçlar
+# ------------------------------------------------------------------ #
 if data is None:
-    st.info("Sol panelden A/B koordinatlarını girip **'Koridor Verisini Getir'** butonuna basın.")
+    if input_mode == "manual":
+        st.info("Sol panelden A/B koordinatlarını girip **'Koridor Verisini Getir'** butonuna basın.")
 else:
-    if data.route_source == "road_snapped":
+    if data.route_source == "sketch_matched":
+        st.success(
+            "✅ Çiziminiz gerçek yol ağına oturtuldu (map-matching) ve "
+            "direkler bu rotanın kenarına offsetli olarak yerleştirildi."
+        )
+    elif data.route_source == "road_snapped":
         st.success("✅ Direkler yol ağı üzerinden hesaplanan rotaya oturtuldu (kenar offsetli).")
     else:
         st.warning(
-            "⚠️ Yol ağı üzerinden rota bulunamadı — A-B düz hattına geri "
-            "dönüldü. Bu durumda düğümler bina/arazi üzerinden geçebilir; "
-            "sonuç yalnızca kaba bir ön izlemedir."
+            "⚠️ Yol ağı üzerinden geçerli bir rota bulunamadı — düz hatta "
+            "geri dönüldü. Bu durumda düğümler bina/arazi üzerinden "
+            "geçebilir; sonuç yalnızca kaba bir ön izlemedir."
         )
 
     num_corners = sum(1 for n in data.virtual_nodes if n.is_corner)
@@ -92,32 +205,61 @@ else:
     col4.metric("Sanal Düğüm", len(data.virtual_nodes))
     col5.metric("Köşe/Kavşak Direği", num_corners)
 
+    st.caption("💡 Haritadaki herhangi bir direk simgesine **tıklayarak** koordinatlarını görebilirsiniz.")
+
     mid_lat = (data.start.lat + data.end.lat) / 2
     mid_lon = (data.start.lon + data.end.lon) / 2
 
     fmap = folium.Map(location=[mid_lat, mid_lon], zoom_start=15, tiles="OpenStreetMap")
 
     folium.Marker(
-        [data.start.lat, data.start.lon], tooltip="A - Başlangıç",
+        [data.start.lat, data.start.lon],
+        tooltip="A - Başlangıç",
+        popup=folium.Popup(
+            f"<b>A - Başlangıç</b><br>Lat: {data.start.lat:.6f}<br>Lon: {data.start.lon:.6f}",
+            max_width=250,
+        ),
         icon=folium.Icon(color="green"),
     ).add_to(fmap)
     folium.Marker(
-        [data.end.lat, data.end.lon], tooltip="B - Bitiş",
+        [data.end.lat, data.end.lon],
+        tooltip="B - Bitiş",
+        popup=folium.Popup(
+            f"<b>B - Bitiş</b><br>Lat: {data.end.lat:.6f}<br>Lon: {data.end.lon:.6f}",
+            max_width=250,
+        ),
         icon=folium.Icon(color="red"),
     ).add_to(fmap)
 
+    # Kullanıcının çizdiği ham krokiyi de referans olarak (soluk, kesikli
+    # çizgi) haritaya ekleyelim ki hesaplanan rotayla karşılaştırılabilsin.
+    if sketch_points:
+        folium.PolyLine(
+            [(p.lat, p.lon) for p in sketch_points],
+            color="#e91e63",
+            weight=3,
+            opacity=0.5,
+            dash_array="6,8",
+            tooltip="Sizin çiziminiz (ham kroki)",
+        ).add_to(fmap)
+
     for node in data.virtual_nodes:
         is_corner = node.is_corner
+        label = "🔴 Köşe/Kavşak Direği" if is_corner else "🔵 Ara Direk"
+        popup_html = (
+            f"<b>{label} #{node.node_id}</b><br>"
+            f"Enlem (lat): {node.point.lat:.6f}<br>"
+            f"Boylam (lon): {node.point.lon:.6f}<br>"
+            f"A'dan mesafe: {node.cumulative_distance_m:.0f} m"
+        )
         folium.CircleMarker(
             [node.point.lat, node.point.lon],
             radius=7 if is_corner else 4,
             color="#d62728" if is_corner else "#1f77b4",
             fill=True,
             fill_opacity=0.9 if is_corner else 0.8,
-            tooltip=(
-                f"{'🔴 Köşe/Kavşak Direği' if is_corner else 'Ara Direk'} "
-                f"#{node.node_id} ({node.cumulative_distance_m:.0f}m)"
-            ),
+            tooltip=f"{label} #{node.node_id} ({node.cumulative_distance_m:.0f}m) — koordinat için tıklayın",
+            popup=folium.Popup(popup_html, max_width=250),
         ).add_to(fmap)
 
     if data.corridor_polygon is not None:
@@ -126,4 +268,4 @@ else:
             style_function=lambda _: {"color": "#ff7f0e", "fillOpacity": 0.05},
         ).add_to(fmap)
 
-    st_folium(fmap, width=None, height=600, returned_objects=[])
+    st_folium(fmap, width=None, height=600, returned_objects=[], key="result_map")
