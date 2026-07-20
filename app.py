@@ -39,6 +39,17 @@ with st.sidebar:
     buffer_m = st.slider("Koridor genişliği (m)", 50, 500, 150, step=10)
     spacing_m = st.slider("Direk aralığı / span (m)", 20, 100, 40, step=5)
 
+    st.subheader("Direk Konumlandırma")
+    offset_m = st.slider(
+        "Yol kenarı offseti (m)", 0, 15, 5, step=1,
+        help="Direklerin yol orta hattından kaldırım kenarına doğru ne kadar kaydırılacağı.",
+    )
+    offset_side = st.radio(
+        "Offset yönü (A→B'ye bakarken)", options=["right", "left"],
+        format_func=lambda v: "Sağ" if v == "right" else "Sol",
+        horizontal=True,
+    )
+
     run_button = st.button("🚀 Koridor Verisini Getir", type="primary")
 
 if run_button:
@@ -49,6 +60,8 @@ if run_button:
                 end=GeoPoint(lat=end_lat, lon=end_lon),
                 corridor_buffer_m=float(buffer_m),
                 node_spacing_m=float(spacing_m),
+                pole_offset_m=float(offset_m),
+                offset_side=offset_side,
             )
             data = collector.run()
             st.session_state["corridor_data"] = data
@@ -61,11 +74,23 @@ data = st.session_state.get("corridor_data")
 if data is None:
     st.info("Sol panelden A/B koordinatlarını girip **'Koridor Verisini Getir'** butonuna basın.")
 else:
-    col1, col2, col3, col4 = st.columns(4)
+    if data.route_source == "road_snapped":
+        st.success("✅ Direkler yol ağı üzerinden hesaplanan rotaya oturtuldu (kenar offsetli).")
+    else:
+        st.warning(
+            "⚠️ Yol ağı üzerinden rota bulunamadı — A-B düz hattına geri "
+            "dönüldü. Bu durumda düğümler bina/arazi üzerinden geçebilir; "
+            "sonuç yalnızca kaba bir ön izlemedir."
+        )
+
+    num_corners = sum(1 for n in data.virtual_nodes if n.is_corner)
+
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Bina Sayısı", len(data.buildings_gdf))
     col2.metric("Engel Poligonu", len(data.obstacles_gdf))
     col3.metric("Yol Segmenti", len(data.roads_gdf))
     col4.metric("Sanal Düğüm", len(data.virtual_nodes))
+    col5.metric("Köşe/Kavşak Direği", num_corners)
 
     mid_lat = (data.start.lat + data.end.lat) / 2
     mid_lon = (data.start.lon + data.end.lon) / 2
@@ -82,13 +107,17 @@ else:
     ).add_to(fmap)
 
     for node in data.virtual_nodes:
+        is_corner = node.is_corner
         folium.CircleMarker(
             [node.point.lat, node.point.lon],
-            radius=4,
-            color="#1f77b4",
+            radius=7 if is_corner else 4,
+            color="#d62728" if is_corner else "#1f77b4",
             fill=True,
-            fill_opacity=0.8,
-            tooltip=f"Düğüm #{node.node_id} ({node.cumulative_distance_m:.0f}m)",
+            fill_opacity=0.9 if is_corner else 0.8,
+            tooltip=(
+                f"{'🔴 Köşe/Kavşak Direği' if is_corner else 'Ara Direk'} "
+                f"#{node.node_id} ({node.cumulative_distance_m:.0f}m)"
+            ),
         ).add_to(fmap)
 
     if data.corridor_polygon is not None:
