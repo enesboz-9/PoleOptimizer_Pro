@@ -572,33 +572,32 @@ if input_mode == "sketch":
     # bir güvence katmanı).
     CHAIN_MERGE_SNAP_M = 30.0
 
-    def _merge_line_drawings(line_drawings):
-        """Haritada ayrı ayrı çizilmiş birden fazla çizgi parçasını,
-        birbirine en yakın uçlarından zincirleyerek TEK bir güzergaha
-        birleştirir.
+    def _split_into_chains(line_drawings):
+        """Haritada ayrı ayrı çizilmiş çizgi parçalarını, birbirine en
+        yakın uçlarından zincirleyerek BAĞLANTILI GRUPLARA (bileşenlere)
+        ayırır. Uçları birbirine yakın olan parçalar tek bir zincirde
+        birleşir; birbirinden uzak duran (ör. aynı yolun İKİ AYRI
+        TARAFI/PARALEL iki sokak gibi kasıtlı olarak ayrık çizilmiş)
+        parçalar KENDİ ayrı zincirlerinde kalır — hiçbiri atılmaz.
 
-        NEDEN GEREKLİ: Tarayıcıdaki otomatik uç-birleştirme (bkz.
-        `SketchLineTools`) genelde parçaları çizim sırasında zaten
-        birleştirir; ancak parçalar piksel eşiğinin biraz dışında
-        bırakılmışsa (ör. elle hassas birleştirilememişse) `all_drawings`
-        içinde ayrık kalabilir. Önceki davranış bu durumda yalnızca en
-        UZUN parçayı kullanıp diğerlerindeki TÜM noktaları sessizce
-        atıyordu — "bazı noktalar alınmıyor" şikayetinin asıl nedeni
-        buydu. Bu fonksiyon onun yerine, mevcut tüm parçaları (varsa)
-        uç uca zincirleyerek hiçbir noktayı kaybetmemeye çalışır.
+        ESKİ DAVRANIŞ (bug): tüm parçalar TEK bir zincire zorlanıyordu;
+        birbirine bağlanamayan (paralel/ayrık) parça(lar) "leftover"
+        sayılıp sessizce hesap dışı bırakılıyordu. Bu yüzden "aynı yolun
+        iki tarafını çizince bir tarafı gitmiyor" sorunu oluşuyordu.
+        Artık her bağlı grup kendi ayrı güzergahı olarak korunuyor ve
+        çağıran kod (aşağıda) her biri için AYRI AYRI direk hesabı
+        çalıştırıyor.
 
         Returns:
-            (merged_coords_lonlat, leftover_count) — `leftover_count`,
-            hiçbir uca yeterince yakın olmadığı için zincire eklenemeyen
-            (ayrık kalan) parça sayısıdır; kullanıcıyı uyarmak için
-            kullanılır.
+            List[List[[lon, lat], ...]] — her biri bağımsız bir hattı
+            temsil eden koordinat listelerinden oluşan liste.
         """
         if not line_drawings:
-            return None, 0
+            return []
 
         all_segments = [list(d["geometry"]["coordinates"]) for d in line_drawings]
         if len(all_segments) == 1:
-            return all_segments[0], 0
+            return [all_segments[0]]
 
         def _dist(p1, p2):
             lon1, lat1 = p1
@@ -607,15 +606,14 @@ if input_mode == "sketch":
                 GeoPoint(lat=lat1, lon=lon1), GeoPoint(lat=lat2, lon=lon2)
             )
 
-        def _grow_chain(seed_idx):
-            segments = list(all_segments)
-            chain = segments.pop(seed_idx)
+        def _grow_chain(seed, pool):
+            chain = seed
             merged_any = True
-            while merged_any and segments:
+            while merged_any and pool:
                 merged_any = False
                 chain_start, chain_end = chain[0], chain[-1]
                 best = None  # (index, mode, dist)
-                for i, seg in enumerate(segments):
+                for i, seg in enumerate(pool):
                     seg_start, seg_end = seg[0], seg[-1]
                     for mode, dist in (
                         ("end_to_start", _dist(chain_end, seg_start)),
@@ -627,7 +625,7 @@ if input_mode == "sketch":
                             best = (i, mode, dist)
                 if best is not None:
                     i, mode, _dist_val = best
-                    seg = segments.pop(i)
+                    seg = pool.pop(i)
                     if mode == "end_to_start":
                         chain = chain + seg[1:]
                     elif mode == "end_to_end":
@@ -637,55 +635,57 @@ if input_mode == "sketch":
                     elif mode == "start_to_end":
                         chain = seg[:-1] + chain
                     merged_any = True
-            return chain, len(segments)
+            return chain
 
-        # Hangi parçanın "ana zincirin" bir parçası olduğu (dolayısıyla
-        # hangisinden başlanması gerektiği) önceden bilinemez — tesadüfen
-        # en uzun parça ayrık/yalnız bir parça olabilir. Bu yüzden HER
-        # parça sırayla başlangıç adayı olarak denenir; en az parçayı
-        # dışarıda bırakan (bağlanamayan) sonuç seçilir. Eşitlik durumunda
-        # en uzun birleşik hat tercih edilir.
-        best_result = None  # (leftover_count, -merged_length, chain)
-        for seed_idx in range(len(all_segments)):
-            chain, leftover_count = _grow_chain(seed_idx)
-            merged_length = _line_length_m(chain)
-            key = (leftover_count, -merged_length)
-            if best_result is None or key < best_result[0]:
-                best_result = (key, chain)
+        remaining = list(all_segments)
+        chains = []
+        while remaining:
+            seed = remaining.pop(0)
+            chain = _grow_chain(seed, remaining)
+            chains.append(chain)
+        # En uzun hat en başta gösterilsin (ör. "A tarafı" olarak).
+        chains.sort(key=_line_length_m, reverse=True)
+        return chains
 
-        return best_result[1], best_result[0][0]
-
-    sketch_coords_lonlat = None
-    unmerged_segment_count = 0
+    sketch_chains_lonlat = []
     if draw_result:
         drawings = draw_result.get("all_drawings") or []
         line_drawings = [
             d for d in drawings if d.get("geometry", {}).get("type") == "LineString"
         ]
         if line_drawings:
-            sketch_coords_lonlat, unmerged_segment_count = _merge_line_drawings(line_drawings)
+            sketch_chains_lonlat = _split_into_chains(line_drawings)
+
+    sketch_chains = [
+        [GeoPoint(lat=lat, lon=lon) for lon, lat in chain]
+        for chain in sketch_chains_lonlat
+        if len(chain) >= 2
+    ]
 
     status_col, action_col = st.columns([3, 1], vertical_alignment="center")
     with status_col:
-        if sketch_coords_lonlat and len(sketch_coords_lonlat) >= 2:
-            st.success(f"✅ Çizim algılandı: {len(sketch_coords_lonlat)} nokta. Hesaplamaya hazır.")
-            if unmerged_segment_count:
-                st.warning(
-                    f"⚠️ {unmerged_segment_count} çizgi parçası, en yakın "
-                    f"ucu diğerlerinden {CHAIN_MERGE_SNAP_M:.0f} m'den fazla "
-                    "uzakta kaldığı için ana güzergaha zincirlenemedi ve "
-                    "HESABA KATILMADI. Bu parça(lar)ı ana çizginin ucuna "
-                    "daha yakın çizip tekrar deneyin, ya da haritada silip "
-                    "yeniden bağlayın."
+        if sketch_chains:
+            total_points = sum(len(c) for c in sketch_chains)
+            if len(sketch_chains) == 1:
+                st.success(f"✅ Çizim algılandı: {total_points} nokta. Hesaplamaya hazır.")
+            else:
+                st.success(
+                    f"✅ {len(sketch_chains)} AYRI hat algılandı (toplam "
+                    f"{total_points} nokta). Uçları birbirine "
+                    f"{CHAIN_MERGE_SNAP_M:.0f} m'den yakın olmayan çizgiler "
+                    "artık atılmıyor — her biri kendi bağımsız güzergahı "
+                    "olarak (ör. aynı yolun iki tarafı için) AYRI AYRI "
+                    "hesaplanıp haritada farklı renkte gösterilecek."
                 )
-            sketch_points = [GeoPoint(lat=lat, lon=lon) for lon, lat in sketch_coords_lonlat]
+            sketch_points = sketch_chains[0]
         else:
+            sketch_points = None
             st.info("Henüz bir çizgi çizilmedi. Haritadan bir hat çizin.")
     with action_col:
         run_button = st.button(
             "🚀 Direkleri Hesapla",
             type="primary",
-            disabled=sketch_points is None,
+            disabled=not sketch_chains,
             use_container_width=True,
         )
 else:
@@ -697,22 +697,28 @@ else:
 if run_button:
     with st.spinner("OSM verisi çekiliyor ve sanal düğümler üretiliyor... (biraz sürebilir)"):
         try:
+            runs = []
             if input_mode == "sketch":
-                start_pt = sketch_points[0]
-                end_pt = sketch_points[-1]
-                collector = CorridorDataCollector(
-                    start=start_pt,
-                    end=end_pt,
-                    corridor_buffer_m=float(buffer_m),
-                    node_spacing_m=float(spacing_m),
-                    pole_offset_m=float(offset_m),
-                    offset_side=offset_side,
-                    voltage_class=voltage_class,
-                )
-                data = collector.run(
-                    sketch_points=sketch_points,
-                    direct_line_mode=use_direct_line,
-                )
+                # Her AYRI çizilmiş hat (ör. aynı yolun iki tarafı) kendi
+                # A/B'siyle bağımsız bir koleksiyon/rota olarak çalıştırılır
+                # — böylece hiçbiri diğerinin "leftover"ı olarak atılmaz.
+                for chain_points in sketch_chains:
+                    start_pt = chain_points[0]
+                    end_pt = chain_points[-1]
+                    collector = CorridorDataCollector(
+                        start=start_pt,
+                        end=end_pt,
+                        corridor_buffer_m=float(buffer_m),
+                        node_spacing_m=float(spacing_m),
+                        pole_offset_m=float(offset_m),
+                        offset_side=offset_side,
+                        voltage_class=voltage_class,
+                    )
+                    chain_data = collector.run(
+                        sketch_points=chain_points,
+                        direct_line_mode=use_direct_line,
+                    )
+                    runs.append((chain_data, collector, chain_points))
             else:
                 collector = CorridorDataCollector(
                     start=GeoPoint(lat=start_lat, lon=start_lon),
@@ -724,14 +730,21 @@ if run_button:
                     voltage_class=voltage_class,
                 )
                 data = collector.run()
-            st.session_state["corridor_data"] = data
-            st.session_state["max_span_m"] = collector.max_span_m
-            st.session_state["voltage_class_used"] = collector.voltage_class
+                runs.append((data, collector, None))
+
+            st.session_state["corridor_runs"] = runs
+            # Geriye dönük uyumluluk (diğer kodun tekil `corridor_data`
+            # okuduğu yerler için): ilk/en uzun hattı ana veri olarak tut.
+            st.session_state["corridor_data"] = runs[0][0]
+            st.session_state["max_span_m"] = runs[0][1].max_span_m
+            st.session_state["voltage_class_used"] = runs[0][1].voltage_class
         except Exception as exc:  # noqa: BLE001
             st.error(f"Veri toplama sırasında bir hata oluştu: {exc}")
             st.session_state.pop("corridor_data", None)
+            st.session_state.pop("corridor_runs", None)
 
 data = st.session_state.get("corridor_data")
+corridor_runs = st.session_state.get("corridor_runs") or []
 
 # ------------------------------------------------------------------ #
 # Sonuçlar
@@ -740,42 +753,64 @@ if data is None:
     if input_mode == "manual":
         st.info("Sol panelden A/B koordinatlarını girip **'Koridor Verisini Getir'** butonuna basın.")
 else:
-    if data.route_source == "sketch_matched":
-        st.success(
-            "✅ Çiziminiz gerçek yol ağına oturtuldu (map-matching) ve "
-            "direkler bu rotanın kenarına offsetli olarak yerleştirildi."
-        )
-    elif data.route_source == "sketch_direct":
-        st.success(
-            "✅ Doğrudan hat modu: direkler yol ağına oturtulmadan, "
-            "tam olarak çizdiğiniz kroki üzerine (offset ayarınıza göre "
-            "kaydırılarak) yerleştirildi."
-        )
-    elif data.route_source == "road_snapped":
-        st.success("✅ Direkler yol ağı üzerinden hesaplanan rotaya oturtuldu (kenar offsetli).")
-    else:
-        st.warning(
-            "⚠️ Yol ağı üzerinden geçerli bir rota bulunamadı — düz hatta "
-            "geri dönüldü. Bu durumda düğümler bina/arazi üzerinden "
-            "geçebilir; sonuç yalnızca kaba bir ön izlemedir."
-        )
+    _run_labels = ["A tarafı", "B tarafı", "C tarafı", "D tarafı"]
 
-    num_angle = sum(1 for n in data.virtual_nodes if n.pole_type == "açı")
-    num_end = sum(1 for n in data.virtual_nodes if n.pole_type == "nihayet")
+    def _route_source_msg(route_source, label=None):
+        prefix = f"**[{label}]** " if label else ""
+        if route_source == "sketch_matched":
+            st.success(
+                f"✅ {prefix}Çiziminiz gerçek yol ağına oturtuldu (map-matching) "
+                "ve direkler bu rotanın kenarına offsetli olarak yerleştirildi."
+            )
+        elif route_source == "sketch_direct":
+            st.success(
+                f"✅ {prefix}Doğrudan hat modu: direkler yol ağına oturtulmadan, "
+                "tam olarak çizdiğiniz kroki üzerine (offset ayarınıza göre "
+                "kaydırılarak) yerleştirildi."
+            )
+        elif route_source == "road_snapped":
+            st.success(f"✅ {prefix}Direkler yol ağı üzerinden hesaplanan rotaya oturtuldu (kenar offsetli).")
+        else:
+            st.warning(
+                f"⚠️ {prefix}Yol ağı üzerinden geçerli bir rota bulunamadı — düz "
+                "hatta geri dönüldü. Bu durumda düğümler bina/arazi üzerinden "
+                "geçebilir; sonuç yalnızca kaba bir ön izlemedir."
+            )
+
+    if len(corridor_runs) > 1:
+        st.info(
+            f"ℹ️ {len(corridor_runs)} bağımsız hat birlikte hesaplandı "
+            "(örn. bir yolun iki tarafı). Her biri aşağıda ayrı renkte "
+            "gösteriliyor ve aralarında **hiçbir kablo bağlantısı "
+            "çizilmiyor**."
+        )
+        for i, (run_data, _collector, _pts) in enumerate(corridor_runs):
+            label = _run_labels[i] if i < len(_run_labels) else f"{i + 1}. hat"
+            _route_source_msg(run_data.route_source, label)
+    else:
+        _route_source_msg(data.route_source)
+
+    all_nodes = [n for run_data, _c, _p in corridor_runs for n in run_data.virtual_nodes]
+    num_angle = sum(1 for n in all_nodes if n.pole_type == "açı")
+    num_end = sum(1 for n in all_nodes if n.pole_type == "nihayet")
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Bina Sayısı", len(data.buildings_gdf))
-    col2.metric("Engel Poligonu", len(data.obstacles_gdf))
-    col3.metric("Yol Segmenti", len(data.roads_gdf))
-    col4.metric("Sanal Düğüm", len(data.virtual_nodes))
+    col1.metric("Bina Sayısı", sum(len(r[0].buildings_gdf) for r in corridor_runs))
+    col2.metric("Engel Poligonu", sum(len(r[0].obstacles_gdf) for r in corridor_runs))
+    col3.metric("Yol Segmenti", sum(len(r[0].roads_gdf) for r in corridor_runs))
+    col4.metric("Sanal Düğüm (toplam)", len(all_nodes))
     col5.metric("Açı / Nihayet Direği", f"{num_angle} / {num_end}")
+    if len(corridor_runs) > 1:
+        st.caption(
+            "ℹ️ Yukarıdaki bina/engel/yol sayıları hatlar arasında "
+            "çakışan koridor alanları varsa aynı öğeyi birden fazla kez "
+            "sayabilir; bu yalnızca bir ön izleme özetidir."
+        )
 
     _max_span = st.session_state.get("max_span_m")
     _voltage_used = st.session_state.get("voltage_class_used")
     if _max_span is not None:
-        _over_limit = [
-            n for n in data.virtual_nodes if n.span_length_m > _max_span + 1e-6
-        ]
+        _over_limit = [n for n in all_nodes if n.span_length_m > _max_span + 1e-6]
         if _over_limit:
             st.warning(
                 f"⚠️ {len(_over_limit)} direğin açıklığı, seçilen gerilim "
@@ -816,78 +851,63 @@ else:
     )
 
     with st.expander("🔧 Teşhis Bilgisi (sorun bildirirken bu bölümü paylaşın)"):
-        raw_sketch_len_m = None
-        if sketch_points and len(sketch_points) >= 2:
-            raw_sketch_len_m = sum(
-                haversine_distance_m(sketch_points[i], sketch_points[i + 1])
-                for i in range(len(sketch_points) - 1)
+        diag_runs = []
+        for i, (run_data, _c, run_points) in enumerate(corridor_runs):
+            raw_len_m = None
+            if run_points and len(run_points) >= 2:
+                raw_len_m = sum(
+                    haversine_distance_m(run_points[j], run_points[j + 1])
+                    for j in range(len(run_points) - 1)
+                )
+            computed_len_m = (
+                run_data.virtual_nodes[-1].cumulative_distance_m
+                if run_data.virtual_nodes else 0.0
             )
-        computed_route_len_m = (
-            data.virtual_nodes[-1].cumulative_distance_m if data.virtual_nodes else 0.0
-        )
+            label = _run_labels[i] if i < len(_run_labels) else f"{i + 1}. hat"
+            diag_runs.append({
+                "hat": label,
+                "route_source": run_data.route_source,
+                "cizilen_kroki_nokta_sayisi": len(run_points) if run_points else 0,
+                "cizilen_kroki_toplam_uzunluk_m": (
+                    round(raw_len_m, 1) if raw_len_m is not None else None
+                ),
+                "hesaplanan_rota_toplam_uzunluk_m": round(computed_len_m, 1),
+                "uretilen_direk_sayisi": len(run_data.virtual_nodes),
+                "A_baslangic": [round(run_data.start.lat, 6), round(run_data.start.lon, 6)],
+                "B_bitis": [round(run_data.end.lat, 6), round(run_data.end.lon, 6)],
+            })
+            if (
+                raw_len_m is not None
+                and computed_len_m < 0.5 * raw_len_m
+            ):
+                st.error(
+                    f"⚠️ [{label}] Hesaplanan rota, çizdiğiniz krokinin "
+                    "uzunluğunun yarısından kısa. Bu, direklerin krokinin "
+                    "büyük kısmı boyunca değil sadece küçük bir parçasında "
+                    "üretildiği anlamına gelir."
+                )
         st.json({
             "input_mode": input_mode,
             "direct_line_mode_secildi_mi": (
                 use_direct_line if input_mode == "sketch" else "n/a (manuel mod)"
             ),
-            "route_source": data.route_source,
-            "cizilen_kroki_nokta_sayisi": len(sketch_points) if sketch_points else 0,
-            "cizilen_kroki_toplam_uzunluk_m": (
-                round(raw_sketch_len_m, 1) if raw_sketch_len_m is not None else None
-            ),
-            "hesaplanan_rota_toplam_uzunluk_m": round(computed_route_len_m, 1),
-            "uretilen_direk_sayisi": len(data.virtual_nodes),
-            "A_baslangic": [round(data.start.lat, 6), round(data.start.lon, 6)],
-            "B_bitis": [round(data.end.lat, 6), round(data.end.lon, 6)],
+            "hat_sayisi": len(corridor_runs),
+            "hatlar": diag_runs,
         })
-        if (
-            raw_sketch_len_m is not None
-            and computed_route_len_m < 0.5 * raw_sketch_len_m
-        ):
-            st.error(
-                "⚠️ Hesaplanan rota, çizdiğiniz krokinin uzunluğunun "
-                "yarısından kısa. Bu, direklerin krokinin büyük kısmı "
-                "boyunca değil sadece küçük bir parçasında üretildiği "
-                "anlamına gelir. Bu paneldeki bilgileri (özellikle "
-                "route_source ve uzunluk değerlerini) ekran görüntüsüyle "
-                "birlikte paylaşırsanız kesin sebebi bulabiliriz."
-            )
 
-    mid_lat = (data.start.lat + data.end.lat) / 2
-    mid_lon = (data.start.lon + data.end.lon) / 2
+    RUN_CABLE_COLORS = ["#2ca02c", "#ff7f0e", "#9467bd", "#17becf"]
+    RUN_SKETCH_COLORS = ["#e91e63", "#3f51b5", "#009688", "#795548"]
+
+    all_lats = [n.point.lat for r in corridor_runs for n in r[0].virtual_nodes] or [
+        r[0].start.lat for r in corridor_runs
+    ]
+    all_lons = [n.point.lon for r in corridor_runs for n in r[0].virtual_nodes] or [
+        r[0].start.lon for r in corridor_runs
+    ]
+    mid_lat = sum(all_lats) / len(all_lats)
+    mid_lon = sum(all_lons) / len(all_lons)
 
     fmap = folium.Map(location=[mid_lat, mid_lon], zoom_start=15, tiles="OpenStreetMap")
-
-    folium.Marker(
-        [data.start.lat, data.start.lon],
-        tooltip="A - Başlangıç",
-        popup=folium.Popup(
-            f"<b>A - Başlangıç</b><br>Lat: {data.start.lat:.6f}<br>Lon: {data.start.lon:.6f}",
-            max_width=250,
-        ),
-        icon=folium.Icon(color="green"),
-    ).add_to(fmap)
-    folium.Marker(
-        [data.end.lat, data.end.lon],
-        tooltip="B - Bitiş",
-        popup=folium.Popup(
-            f"<b>B - Bitiş</b><br>Lat: {data.end.lat:.6f}<br>Lon: {data.end.lon:.6f}",
-            max_width=250,
-        ),
-        icon=folium.Icon(color="red"),
-    ).add_to(fmap)
-
-    # Kullanıcının çizdiği ham krokiyi de referans olarak (soluk, kesikli
-    # çizgi) haritaya ekleyelim ki hesaplanan rotayla karşılaştırılabilsin.
-    if sketch_points:
-        folium.PolyLine(
-            [(p.lat, p.lon) for p in sketch_points],
-            color="#e91e63",
-            weight=3,
-            opacity=0.5,
-            dash_array="6,8",
-            tooltip="Sizin çiziminiz (ham kroki)",
-        ).add_to(fmap)
 
     pole_type_style = {
         "nihayet": ("#9467bd", "🟣 Nihayet Direği", 8),
@@ -896,83 +916,131 @@ else:
     }
     max_span_for_run = st.session_state.get("max_span_m")
 
-    prev_node = None
-    for node in data.virtual_nodes:
-        color, label, radius = pole_type_style.get(
-            node.pole_type, pole_type_style["ara"]
+    for run_idx, (run_data, _collector, run_points) in enumerate(corridor_runs):
+        run_label = (
+            _run_labels[run_idx] if run_idx < len(_run_labels) else f"{run_idx + 1}. hat"
         )
-        span_exceeds = (
-            max_span_for_run is not None
-            and node.span_length_m > max_span_for_run + 1e-6
-        )
-        popup_html = (
-            f"<b>{label} #{node.node_id}</b><br>"
-            f"Enlem (lat): {node.point.lat:.6f}<br>"
-            f"Boylam (lon): {node.point.lon:.6f}<br>"
-            f"A'dan mesafe: {node.cumulative_distance_m:.0f} m<br>"
-            + (
-                f"Sapma açısı: {node.deflection_angle_deg:.0f}°<br>"
-                if node.is_corner and node.node_id > 0
-                else ""
-            )
-            + (
-                f"Önceki direğe mesafe: {node.span_length_m:.0f} m"
-                + (" ⚠️ azami açıklığı aşıyor" if span_exceeds else "")
-                if node.node_id > 0
-                else "Önceki direk yok (başlangıç)"
-            )
-        )
-        folium.CircleMarker(
-            [node.point.lat, node.point.lon],
-            radius=radius,
-            color="#ff9800" if span_exceeds else color,
-            fill=True,
-            fill_opacity=0.9 if node.is_corner else 0.8,
-            tooltip=f"{label} #{node.node_id} ({node.cumulative_distance_m:.0f}m) — koordinat için tıklayın",
-            popup=folium.Popup(popup_html, max_width=250),
+        side_tag = f" ({run_label})" if len(corridor_runs) > 1 else ""
+        cable_color = RUN_CABLE_COLORS[run_idx % len(RUN_CABLE_COLORS)]
+        sketch_color = RUN_SKETCH_COLORS[run_idx % len(RUN_SKETCH_COLORS)]
+
+        folium.Marker(
+            [run_data.start.lat, run_data.start.lon],
+            tooltip=f"A - Başlangıç{side_tag}",
+            popup=folium.Popup(
+                f"<b>A - Başlangıç{side_tag}</b><br>"
+                f"Lat: {run_data.start.lat:.6f}<br>Lon: {run_data.start.lon:.6f}",
+                max_width=250,
+            ),
+            icon=folium.Icon(color="green"),
+        ).add_to(fmap)
+        folium.Marker(
+            [run_data.end.lat, run_data.end.lon],
+            tooltip=f"B - Bitiş{side_tag}",
+            popup=folium.Popup(
+                f"<b>B - Bitiş{side_tag}</b><br>"
+                f"Lat: {run_data.end.lat:.6f}<br>Lon: {run_data.end.lon:.6f}",
+                max_width=250,
+            ),
+            icon=folium.Icon(color="red"),
         ).add_to(fmap)
 
-        # Direkler arası kablo geçişini (fiziksel hat güzergahını) her
-        # zaman kesikli bir çizgiyle gösteriyoruz — bu, "Direkler arası
-        # mesafeyi göster" seçeneğinden bağımsızdır; o seçenek yalnızca
-        # segment üzerindeki metre etiketini açıp kapatır.
-        if prev_node is not None:
+        # Kullanıcının çizdiği ham krokiyi de referans olarak (soluk,
+        # kesikli çizgi) haritaya ekleyelim ki hesaplanan rotayla
+        # karşılaştırılabilsin. Her hat kendi rengiyle gösterilir.
+        if run_points:
             folium.PolyLine(
-                [
-                    (prev_node.point.lat, prev_node.point.lon),
-                    (node.point.lat, node.point.lon),
-                ],
-                color="#2ca02c",
+                [(p.lat, p.lon) for p in run_points],
+                color=sketch_color,
                 weight=3,
-                opacity=0.85,
-                dash_array="10,6",
-                tooltip=f"Kablo geçişi: {node.span_length_m:.0f} m",
+                opacity=0.5,
+                dash_array="6,8",
+                tooltip=f"Sizin çiziminiz (ham kroki){side_tag}",
             ).add_to(fmap)
 
-        # İsteğe bağlı: bu direkle bir önceki direk arasındaki mesafeyi
-        # segment üzerinde bir etiket olarak da göster.
-        if show_span_distances and prev_node is not None:
-            mid_seg_lat = (prev_node.point.lat + node.point.lat) / 2
-            mid_seg_lon = (prev_node.point.lon + node.point.lon) / 2
-            folium.Marker(
-                [mid_seg_lat, mid_seg_lon],
-                icon=folium.DivIcon(
-                    html=(
-                        "<div style='font-size:11px;font-weight:600;"
-                        "color:#1a1a1a;background:rgba(255,255,255,0.85);"
-                        "padding:1px 4px;border-radius:3px;white-space:nowrap;"
-                        "transform:translate(-50%,-50%);'>"
-                        f"{node.span_length_m:.0f} m</div>"
-                    )
+        # ÖNEMLİ: prev_node her hat başında sıfırlanır — böylece bir
+        # hattın son direği ile bir SONRAKİ (bağımsız) hattın ilk direği
+        # arasında YANLIŞLIKLA kablo çizilmez.
+        prev_node = None
+        for node in run_data.virtual_nodes:
+            color, label, radius = pole_type_style.get(
+                node.pole_type, pole_type_style["ara"]
+            )
+            span_exceeds = (
+                max_span_for_run is not None
+                and node.span_length_m > max_span_for_run + 1e-6
+            )
+            popup_html = (
+                f"<b>{label} #{node.node_id}{side_tag}</b><br>"
+                f"Enlem (lat): {node.point.lat:.6f}<br>"
+                f"Boylam (lon): {node.point.lon:.6f}<br>"
+                f"A'dan mesafe: {node.cumulative_distance_m:.0f} m<br>"
+                + (
+                    f"Sapma açısı: {node.deflection_angle_deg:.0f}°<br>"
+                    if node.is_corner and node.node_id > 0
+                    else ""
+                )
+                + (
+                    f"Önceki direğe mesafe: {node.span_length_m:.0f} m"
+                    + (" ⚠️ azami açıklığı aşıyor" if span_exceeds else "")
+                    if node.node_id > 0
+                    else "Önceki direk yok (başlangıç)"
+                )
+            )
+            folium.CircleMarker(
+                [node.point.lat, node.point.lon],
+                radius=radius,
+                color="#ff9800" if span_exceeds else color,
+                fill=True,
+                fill_opacity=0.9 if node.is_corner else 0.8,
+                tooltip=(
+                    f"{label} #{node.node_id}{side_tag} "
+                    f"({node.cumulative_distance_m:.0f}m) — koordinat için tıklayın"
                 ),
+                popup=folium.Popup(popup_html, max_width=250),
             ).add_to(fmap)
 
-        prev_node = node
+            # Direkler arası kablo geçişini (fiziksel hat güzergahını) her
+            # zaman kesikli bir çizgiyle gösteriyoruz — bu, "Direkler
+            # arası mesafeyi göster" seçeneğinden bağımsızdır; o seçenek
+            # yalnızca segment üzerindeki metre etiketini açıp kapatır.
+            if prev_node is not None:
+                folium.PolyLine(
+                    [
+                        (prev_node.point.lat, prev_node.point.lon),
+                        (node.point.lat, node.point.lon),
+                    ],
+                    color=cable_color,
+                    weight=3,
+                    opacity=0.85,
+                    dash_array="10,6",
+                    tooltip=f"Kablo geçişi{side_tag}: {node.span_length_m:.0f} m",
+                ).add_to(fmap)
 
-    if show_corridor_polygon and data.corridor_polygon is not None:
-        folium.GeoJson(
-            data.corridor_polygon.__geo_interface__,
-            style_function=lambda _: {"color": "#ff7f0e", "fillOpacity": 0.05},
-        ).add_to(fmap)
+            # İsteğe bağlı: bu direkle bir önceki direk arasındaki
+            # mesafeyi segment üzerinde bir etiket olarak da göster.
+            if show_span_distances and prev_node is not None:
+                mid_seg_lat = (prev_node.point.lat + node.point.lat) / 2
+                mid_seg_lon = (prev_node.point.lon + node.point.lon) / 2
+                folium.Marker(
+                    [mid_seg_lat, mid_seg_lon],
+                    icon=folium.DivIcon(
+                        html=(
+                            "<div style='font-size:11px;font-weight:600;"
+                            "color:#1a1a1a;background:rgba(255,255,255,0.85);"
+                            "padding:1px 4px;border-radius:3px;white-space:nowrap;"
+                            "transform:translate(-50%,-50%);'>"
+                            f"{node.span_length_m:.0f} m</div>"
+                        )
+                    ),
+                ).add_to(fmap)
+
+            prev_node = node
+
+        if show_corridor_polygon and run_data.corridor_polygon is not None:
+            folium.GeoJson(
+                run_data.corridor_polygon.__geo_interface__,
+                style_function=lambda _: {"color": "#ff7f0e", "fillOpacity": 0.05},
+            ).add_to(fmap)
 
     st_folium(fmap, width=None, height=600, returned_objects=[], key="result_map")
