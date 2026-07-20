@@ -52,12 +52,13 @@ class SketchLineTools(MacroElement):
     3) Otomatik uç birleştirme -> yeni çizilen bir çizginin ucu, mevcut bir
        çizginin ucuna (piksel bazlı bir eşiğin içinde) denk gelirse iki
        çizgi otomatik olarak TEK bir çizgide birleştirilir (birden fazla
-       aday uç varsa piksel mesafesine göre EN YAKIN olan seçilir). Eğer
-       birleşme hattı kapalı bir döngüye çevirecekse (iki ucu birbirine
-       çok yakınsa) birleştirme YAPILMAZ — bir havai hat güzergahı A'dan
-       B'ye açık bir hattır, kapalı bir çember olması neredeyse her zaman
-       istenmeyen bir durumdur. Çizim sırasında imleç böyle bir uca
-       yaklaşınca yeşil bir halka ile "🔗 Birleştirilecek" ipucu gösterilir.
+       aday uç varsa piksel mesafesine göre EN YAKIN olan seçilir). Bu,
+       kapalı bir döngü (örn. bir bina adasının/apartman bloğunun
+       çevresini dolaşıp başlangıcına yakın biten bir döngü besleme hattı)
+       oluşturacak birleşmeler için de geçerlidir — böyle güzergahlar
+       gerçek ve yaygın bir kullanım biçimi olduğundan artık normal şekilde
+       birleştiriliyor. Çizim sırasında imleç böyle bir uca yaklaşınca
+       yeşil bir halka ile "🔗 Birleştirilecek" ipucu gösterilir.
     """
 
     _template = Template(
@@ -234,9 +235,6 @@ class SketchLineTools(MacroElement):
             //     haritada görünenle tutarsız/hayalet bir geometri seçmesine
             //     yol açabiliyordu. Çözüm: silmeyi SENKRON (aynı tık
             //     içinde) yapmak.
-            function closeEnough(a, b) {
-                return toPx(a).distanceTo(toPx(b)) < SNAP_PX;
-            }
             map.on('draw:created', function(e) {
                 if (e.layerType !== 'polyline') return;
                 clearSnap();
@@ -272,20 +270,18 @@ class SketchLineTools(MacroElement):
 
                 if (!bestMatch) return;
 
-                // Kapalı döngü koruması: birleşme sonucunda ortaya çıkacak
-                // hattın İKİ UCU da birbirine çok yakınsa (kroki kendi
-                // üzerine kapanıyorsa), bu neredeyse HER ZAMAN istenmeyen
-                // bir durumdur — bir havai hat güzergahı A'dan B'ye AÇIK bir
-                // hattır, kapalı bir döngü/dikdörtgen değildir (ekran
-                // görüntüsünde görülen sorun tam olarak buydu: kroki bir
-                // bina adasının etrafını sararak başlangıcına "birleşmiş").
-                // Böyle bir birleşme SESSİZCE yapılmaz; iki çizgi ayrı kalır
-                // ve kullanıcı elle düzenleme/silme aracıyla düzeltebilir.
+                // NOT (düzeltme): Önceden burada, birleşme sonucu ortaya
+                // çıkacak hattın İKİ UCU da birbirine çok yakınsa (kroki
+                // kendi üzerine kapanıyorsa) birleştirme SESSİZCE iptal
+                // ediliyordu. Bu, bir bina adasının/apartman bloğunun
+                // çevresini dolaşan (başlangıca yakın biten) GERÇEK ve
+                // yaygın bir güzergah türünü (döngü/loop besleme hattı)
+                // kırıyordu: parçalar ayrı kalıyor, Python tarafı da yalnızca
+                // "en uzun" parçayı kullanıp diğer parçalardaki tüm noktaları
+                // sessizce atıyordu. Kapalı döngüler artık normal şekilde
+                // birleştiriliyor; kullanıcı yine de istemeden döngü
+                // oluşturursa "✂️ Çizgiyi Kırp" aracıyla elle düzeltebilir.
                 var combined = bestMatch.combined;
-                var combinedStart = combined[0], combinedEnd = combined[combined.length - 1];
-                if (closeEnough(combinedStart, combinedEnd)) {
-                    return;
-                }
 
                 bestMatch.layer.setLatLngs(combined);
                 // Senkron silme: streamlit-folium'un aynı olay turunda
@@ -520,6 +516,15 @@ if input_mode == "sketch":
             "tam olarak çizdiğiniz hat üzerine (offset ayarınız varsa ona "
             "göre kaydırılarak) yerleştirilecek."
         )
+        if offset_side == "auto":
+            st.warning(
+                "⚠️ Bu modda rota = çizdiğiniz hattın kendisi olduğundan, "
+                "'Otomatik' offset yönü hangi tarafı kastettiğinizi tespit "
+                "edemez ve sessizce 'Sağ (A→B'ye bakarken)' varsayılanına "
+                "düşer. Direkler yanlış tarafa yerleşirse, soldaki panelden "
+                "'Offset yönü' seçeneğini elle 'Sol' ya da 'Sağ' olarak "
+                "değiştirip tekrar üretin."
+            )
 
     draw_map = folium.Map(
         location=[center_lat, center_lon], zoom_start=zoom_level, tiles="OpenStreetMap"
@@ -562,26 +567,117 @@ if input_mode == "sketch":
             )
         return total
 
+    # Uç noktaya olan mesafe piksel yerine metre bazlı ölçülüyor (harita
+    # zoom seviyesinden bağımsız, tarayıcı JS tarafındaki SNAP_PX'ten ayrı
+    # bir güvence katmanı).
+    CHAIN_MERGE_SNAP_M = 30.0
+
+    def _merge_line_drawings(line_drawings):
+        """Haritada ayrı ayrı çizilmiş birden fazla çizgi parçasını,
+        birbirine en yakın uçlarından zincirleyerek TEK bir güzergaha
+        birleştirir.
+
+        NEDEN GEREKLİ: Tarayıcıdaki otomatik uç-birleştirme (bkz.
+        `SketchLineTools`) genelde parçaları çizim sırasında zaten
+        birleştirir; ancak parçalar piksel eşiğinin biraz dışında
+        bırakılmışsa (ör. elle hassas birleştirilememişse) `all_drawings`
+        içinde ayrık kalabilir. Önceki davranış bu durumda yalnızca en
+        UZUN parçayı kullanıp diğerlerindeki TÜM noktaları sessizce
+        atıyordu — "bazı noktalar alınmıyor" şikayetinin asıl nedeni
+        buydu. Bu fonksiyon onun yerine, mevcut tüm parçaları (varsa)
+        uç uca zincirleyerek hiçbir noktayı kaybetmemeye çalışır.
+
+        Returns:
+            (merged_coords_lonlat, leftover_count) — `leftover_count`,
+            hiçbir uca yeterince yakın olmadığı için zincire eklenemeyen
+            (ayrık kalan) parça sayısıdır; kullanıcıyı uyarmak için
+            kullanılır.
+        """
+        if not line_drawings:
+            return None, 0
+
+        all_segments = [list(d["geometry"]["coordinates"]) for d in line_drawings]
+        if len(all_segments) == 1:
+            return all_segments[0], 0
+
+        def _dist(p1, p2):
+            lon1, lat1 = p1
+            lon2, lat2 = p2
+            return haversine_distance_m(
+                GeoPoint(lat=lat1, lon=lon1), GeoPoint(lat=lat2, lon=lon2)
+            )
+
+        def _grow_chain(seed_idx):
+            segments = list(all_segments)
+            chain = segments.pop(seed_idx)
+            merged_any = True
+            while merged_any and segments:
+                merged_any = False
+                chain_start, chain_end = chain[0], chain[-1]
+                best = None  # (index, mode, dist)
+                for i, seg in enumerate(segments):
+                    seg_start, seg_end = seg[0], seg[-1]
+                    for mode, dist in (
+                        ("end_to_start", _dist(chain_end, seg_start)),
+                        ("end_to_end", _dist(chain_end, seg_end)),
+                        ("start_to_start", _dist(chain_start, seg_start)),
+                        ("start_to_end", _dist(chain_start, seg_end)),
+                    ):
+                        if dist <= CHAIN_MERGE_SNAP_M and (best is None or dist < best[2]):
+                            best = (i, mode, dist)
+                if best is not None:
+                    i, mode, _dist_val = best
+                    seg = segments.pop(i)
+                    if mode == "end_to_start":
+                        chain = chain + seg[1:]
+                    elif mode == "end_to_end":
+                        chain = chain + list(reversed(seg))[1:]
+                    elif mode == "start_to_start":
+                        chain = list(reversed(chain)) + seg[1:]
+                    elif mode == "start_to_end":
+                        chain = seg[:-1] + chain
+                    merged_any = True
+            return chain, len(segments)
+
+        # Hangi parçanın "ana zincirin" bir parçası olduğu (dolayısıyla
+        # hangisinden başlanması gerektiği) önceden bilinemez — tesadüfen
+        # en uzun parça ayrık/yalnız bir parça olabilir. Bu yüzden HER
+        # parça sırayla başlangıç adayı olarak denenir; en az parçayı
+        # dışarıda bırakan (bağlanamayan) sonuç seçilir. Eşitlik durumunda
+        # en uzun birleşik hat tercih edilir.
+        best_result = None  # (leftover_count, -merged_length, chain)
+        for seed_idx in range(len(all_segments)):
+            chain, leftover_count = _grow_chain(seed_idx)
+            merged_length = _line_length_m(chain)
+            key = (leftover_count, -merged_length)
+            if best_result is None or key < best_result[0]:
+                best_result = (key, chain)
+
+        return best_result[1], best_result[0][0]
+
     sketch_coords_lonlat = None
+    unmerged_segment_count = 0
     if draw_result:
         drawings = draw_result.get("all_drawings") or []
         line_drawings = [
             d for d in drawings if d.get("geometry", {}).get("type") == "LineString"
         ]
         if line_drawings:
-            # Otomatik uç-birleştirme sayesinde genelde tek bir çizgi kalır;
-            # yine de birden fazla ayrık çizgi varsa en son çizileni değil,
-            # en UZUN olanı kullan (birleştirilmiş asıl güzergah tipik olarak
-            # en uzun olandır; küçük yanlışlıkla bırakılmış çiziklerden etkilenmez).
-            line_drawings.sort(
-                key=lambda d: _line_length_m(d["geometry"]["coordinates"]), reverse=True
-            )
-            sketch_coords_lonlat = line_drawings[0]["geometry"]["coordinates"]
+            sketch_coords_lonlat, unmerged_segment_count = _merge_line_drawings(line_drawings)
 
     status_col, action_col = st.columns([3, 1], vertical_alignment="center")
     with status_col:
         if sketch_coords_lonlat and len(sketch_coords_lonlat) >= 2:
             st.success(f"✅ Çizim algılandı: {len(sketch_coords_lonlat)} nokta. Hesaplamaya hazır.")
+            if unmerged_segment_count:
+                st.warning(
+                    f"⚠️ {unmerged_segment_count} çizgi parçası, en yakın "
+                    f"ucu diğerlerinden {CHAIN_MERGE_SNAP_M:.0f} m'den fazla "
+                    "uzakta kaldığı için ana güzergaha zincirlenemedi ve "
+                    "HESABA KATILMADI. Bu parça(lar)ı ana çizginin ucuna "
+                    "daha yakın çizip tekrar deneyin, ya da haritada silip "
+                    "yeniden bağlayın."
+                )
             sketch_points = [GeoPoint(lat=lat, lon=lon) for lon, lat in sketch_coords_lonlat]
         else:
             st.info("Henüz bir çizgi çizilmedi. Haritadan bir hat çizin.")
