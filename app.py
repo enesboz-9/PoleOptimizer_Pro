@@ -13,12 +13,20 @@ arayüz iki giriş yöntemi sunar:
     1) Elle koordinat gir  -> A ve B noktalarını sayısal olarak girip
        en kısa yol ağı rotasını hesaplatma (eski davranış).
     2) Haritada çiz (kalem) -> Kullanıcı haritada başlangıçtan bitişe
-       serbest elle (eğik/yamuk olabilen) bir kroki çizer; uygulama bu
-       krokiyi gerçek OSM yol ağına harita-eşleştirme (map-matching) ile
-       oturtur ve direkleri bu eşleştirilmiş rotanın kenarına yerleştirir.
+       serbest elle (eğik/yamuk olabilen) bir kroki çizer; uygulama
+       varsayılan olarak bu krokiyi gerçek OSM yol ağına harita-
+       eşleştirme (map-matching) ile oturtur ve direkleri bu eşleştirilmiş
+       rotanın kenarına yerleştirir. Çizilen güzergahta OSM'de hiç yol/
+       patika verisi yoksa (orman, arazi, mesire alanı vb.), kullanıcı
+       "Çizdiğim hattı olduğu gibi kullan" seçeneğini işaretleyerek
+       map-matching'i tamamen devre dışı bırakabilir; bu durumda direkler
+       doğrudan çizilen hat üzerine yerleştirilir.
 
 Her iki modda da, sonuç haritasındaki her direğe TIKLANDIĞINDA (hover
-değil, click) koordinatları bir popup içinde gösterilir.
+değil, click) koordinatları ve bir önceki direğe olan mesafesi (span) bir
+popup içinde gösterilir. Ayrıca "Direkler arası mesafeyi göster"
+seçeneği işaretlenirse, her direk çifti arasındaki mesafe haritada
+segment üzerinde etiket olarak da görüntülenir.
 """
 
 import streamlit as st
@@ -182,6 +190,27 @@ if input_mode == "sketch":
         "düzenleme/silme araçlarıyla çizimi düzeltebilirsiniz."
     )
 
+    use_direct_line = st.checkbox(
+        "📍 Çizdiğim hattı olduğu gibi kullan (yol ağına oturtma yapma)",
+        value=False,
+        help=(
+            "İşaretlenirse map-matching TAMAMEN devre dışı kalır ve "
+            "direkler doğrudan sizin çizdiğiniz hat üzerine yerleştirilir. "
+            "OSM'de yol/patika verisi OLMAYAN orman, arazi, mesire alanı "
+            "gibi güzergahlarda kullanın — bu tür bölgelerde uygulama "
+            "krokiyi en yakın (uzaktaki) dış yola oturtmaya çalışıp hattı "
+            "anlamsızlaştırabiliyor. Yol/patika verisi olan güzergahlarda "
+            "bu kutuyu işaretsiz bırakmanız (varsayılan) daha gerçekçi "
+            "sonuç verir."
+        ),
+    )
+    if use_direct_line:
+        st.info(
+            "ℹ️ Doğrudan hat modu aktif: direkler, yol ağına bakılmaksızın "
+            "tam olarak çizdiğiniz hat üzerine (offset ayarınız varsa ona "
+            "göre kaydırılarak) yerleştirilecek."
+        )
+
     draw_map = folium.Map(
         location=[center_lat, center_lon], zoom_start=zoom_level, tiles="OpenStreetMap"
     )
@@ -247,7 +276,10 @@ if run_button:
                     pole_offset_m=float(offset_m),
                     offset_side=offset_side,
                 )
-                data = collector.run(sketch_points=sketch_points)
+                data = collector.run(
+                    sketch_points=sketch_points,
+                    direct_line_mode=use_direct_line,
+                )
             else:
                 collector = CorridorDataCollector(
                     start=GeoPoint(lat=start_lat, lon=start_lon),
@@ -277,6 +309,12 @@ else:
             "✅ Çiziminiz gerçek yol ağına oturtuldu (map-matching) ve "
             "direkler bu rotanın kenarına offsetli olarak yerleştirildi."
         )
+    elif data.route_source == "sketch_direct":
+        st.success(
+            "✅ Doğrudan hat modu: direkler yol ağına oturtulmadan, "
+            "tam olarak çizdiğiniz kroki üzerine (offset ayarınıza göre "
+            "kaydırılarak) yerleştirildi."
+        )
     elif data.route_source == "road_snapped":
         st.success("✅ Direkler yol ağı üzerinden hesaplanan rotaya oturtuldu (kenar offsetli).")
     else:
@@ -296,6 +334,16 @@ else:
     col5.metric("Köşe/Kavşak Direği", num_corners)
 
     st.caption("💡 Haritadaki herhangi bir direk simgesine **tıklayarak** koordinatlarını görebilirsiniz.")
+
+    show_span_distances = st.checkbox(
+        "📏 Direkler arası mesafeyi haritada göster",
+        value=False,
+        help=(
+            "İşaretlenirse, ardışık her iki direk arasına o segmentin "
+            "uzunluğunu (metre) gösteren bir etiket eklenir. Her direğin "
+            "popup'ında da bir önceki direğe olan mesafe zaten yer alır."
+        ),
+    )
 
     mid_lat = (data.start.lat + data.end.lat) / 2
     mid_lon = (data.start.lon + data.end.lon) / 2
@@ -333,6 +381,7 @@ else:
             tooltip="Sizin çiziminiz (ham kroki)",
         ).add_to(fmap)
 
+    prev_node = None
     for node in data.virtual_nodes:
         is_corner = node.is_corner
         label = "🔴 Köşe/Kavşak Direği" if is_corner else "🔵 Ara Direk"
@@ -340,7 +389,12 @@ else:
             f"<b>{label} #{node.node_id}</b><br>"
             f"Enlem (lat): {node.point.lat:.6f}<br>"
             f"Boylam (lon): {node.point.lon:.6f}<br>"
-            f"A'dan mesafe: {node.cumulative_distance_m:.0f} m"
+            f"A'dan mesafe: {node.cumulative_distance_m:.0f} m<br>"
+            + (
+                f"Önceki direğe mesafe: {node.span_length_m:.0f} m"
+                if node.node_id > 0
+                else "Önceki direk yok (başlangıç)"
+            )
         )
         folium.CircleMarker(
             [node.point.lat, node.point.lon],
@@ -351,6 +405,35 @@ else:
             tooltip=f"{label} #{node.node_id} ({node.cumulative_distance_m:.0f}m) — koordinat için tıklayın",
             popup=folium.Popup(popup_html, max_width=250),
         ).add_to(fmap)
+
+        # İsteğe bağlı: bu direkle bir önceki direk arasındaki mesafeyi
+        # segment üzerinde bir etiket olarak göster.
+        if show_span_distances and prev_node is not None:
+            mid_seg_lat = (prev_node.point.lat + node.point.lat) / 2
+            mid_seg_lon = (prev_node.point.lon + node.point.lon) / 2
+            folium.PolyLine(
+                [
+                    (prev_node.point.lat, prev_node.point.lon),
+                    (node.point.lat, node.point.lon),
+                ],
+                color="#2ca02c",
+                weight=2,
+                opacity=0.7,
+            ).add_to(fmap)
+            folium.Marker(
+                [mid_seg_lat, mid_seg_lon],
+                icon=folium.DivIcon(
+                    html=(
+                        "<div style='font-size:11px;font-weight:600;"
+                        "color:#1a1a1a;background:rgba(255,255,255,0.85);"
+                        "padding:1px 4px;border-radius:3px;white-space:nowrap;"
+                        "transform:translate(-50%,-50%);'>"
+                        f"{node.span_length_m:.0f} m</div>"
+                    )
+                ),
+            ).add_to(fmap)
+
+        prev_node = node
 
     if data.corridor_polygon is not None:
         folium.GeoJson(
